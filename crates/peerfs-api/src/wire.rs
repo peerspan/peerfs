@@ -267,6 +267,32 @@ pub enum SnapshotResponse {
     Unchanged,
 }
 
+/// `POST /v1/workspaces/{name}/restore`: restore the workspace's source paths to one of
+/// its current change's snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreRequest {
+    /// The snapshot, or the start of its ID.
+    pub snapshot: String,
+    /// Who is restoring.
+    #[serde(default)]
+    pub caller: Caller,
+}
+
+/// The result of `POST /v1/workspaces/{name}/restore`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreResponse {
+    /// The snapshot restored, in full.
+    pub target: String,
+    /// The snapshot that saved the workspace first, when it had changed since its last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// The snapshot of the restored workspace; absent when it already matched its last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+}
+
 /// A path both sides changed in ways the merge could not combine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -26,8 +26,8 @@ use peerfs_api::{
     CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
     ExportRequest, FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest,
     MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
-    ReceiveResponse, Revision, SOCKET_NAME, SnapshotRequest, SnapshotResponse, SpaceInfo,
-    TrackingInfo, WorkspaceInfo,
+    ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SOCKET_NAME, SnapshotRequest,
+    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 use peerfs_core::{
     Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH,
@@ -115,6 +115,7 @@ fn router_with(state: AppState) -> Router {
         .route("/v1/workspaces/{name}/commit", post(commit))
         .route("/v1/workspaces/{name}/snapshot", post(snapshot))
         .route("/v1/workspaces/{name}/snapshots", get(snapshots))
+        .route("/v1/workspaces/{name}/restore", post(restore))
         .route("/v1/objects/fetch", post(fetch_objects))
         .route("/v1/objects/have", post(have_objects))
         .route(
@@ -302,7 +303,8 @@ impl From<Error> for ApiError {
             Error::NotFound(_)
             | Error::NoSuchBranch(_)
             | Error::NoSuchWorkspace(_)
-            | Error::MissingObject { .. } => (StatusCode::NOT_FOUND, "not_found"),
+            | Error::MissingObject { .. }
+            | Error::NoSuchSnapshot { .. } => (StatusCode::NOT_FOUND, "not_found"),
             Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 (StatusCode::NOT_FOUND, "not_found")
             }
@@ -310,12 +312,14 @@ impl From<Error> for ApiError {
             | Error::WorkspaceExists(_)
             | Error::BranchMoved { .. }
             | Error::NotFastForward { .. }
-            | Error::WorkspaceNotClean(_) => (StatusCode::CONFLICT, "conflict"),
+            | Error::WorkspaceNotClean(_)
+            | Error::BaseMoved(_) => (StatusCode::CONFLICT, "conflict"),
             Error::InvalidName(_)
             | Error::InvalidPath(_)
             | Error::WrongEntry { .. }
             | Error::Unsupported { .. }
-            | Error::InvalidHost(_) => (StatusCode::BAD_REQUEST, "invalid"),
+            | Error::InvalidHost(_)
+            | Error::AmbiguousSnapshot(_) => (StatusCode::BAD_REQUEST, "invalid"),
             Error::UnknownHostKey { .. } => (StatusCode::FORBIDDEN, "forbidden"),
             Error::Remote(_) | Error::RemoteObject { .. } => (StatusCode::BAD_GATEWAY, "remote"),
             _ => return Self::internal(&error),
@@ -766,6 +770,25 @@ async fn snapshot(
                 None => SnapshotResponse::Unchanged,
             },
         ))
+    })
+    .await
+}
+
+async fn restore(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    body: Result<Json<RestoreRequest>, JsonRejection>,
+) -> ApiResult<Json<RestoreResponse>> {
+    let Json(request) = body?;
+    with_space(&state, move |space, host| {
+        let mut workspace = space.workspace(&name)?;
+        let author = author(host, request.caller);
+        let restored = space.restore_workspace(&mut workspace, &request.snapshot, &author)?;
+        Ok(Json(RestoreResponse {
+            target: restored.target.to_string(),
+            before: restored.before.map(|id| id.to_string()),
+            snapshot: restored.snapshot.map(|id| id.to_string()),
+        }))
     })
     .await
 }

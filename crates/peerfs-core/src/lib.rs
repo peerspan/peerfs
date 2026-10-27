@@ -51,7 +51,7 @@ pub use sign::{
     HostKeys, KeyFile, KnownHosts, PUBLIC_KEY_LEN, ParseKeyError, PublicKey, SIGNATURE_LEN,
     SIGNING_CONTEXT, Signature, Signer,
 };
-pub use space::{CommitOutcome, DEFAULT_BRANCH, MergeOutcome, Merged, Space};
+pub use space::{CommitOutcome, DEFAULT_BRANCH, MergeOutcome, Merged, Restored, Space};
 pub use sync::{
     FETCH_BATCH, Pull, Pulled, Push, RawObject, Remote, Tracking, decode_objects, encode_objects,
 };

@@ -432,3 +432,32 @@ fn the_claude_code_hook_snapshots_a_mounted_workspace_after_a_tool_call() {
 
     run(&["ws", "unmount", "w"]);
 }
+
+#[test]
+fn restore_goes_back_to_a_snapshot_by_the_start_of_its_id() {
+    let space = new_space();
+    let run = |args: &[&str], stdin: Option<&str>| ok(&peerfs(&space.path, "a", args, stdin));
+    run(&["ws", "create", "w"], None);
+    run(&["ws", "write", "w", "notes.txt"], Some("one\n"));
+    let first = run(&["ws", "snapshot", "w", "-m", "one"], None);
+    run(&["ws", "write", "w", "notes.txt"], Some("two\n"));
+
+    let prefix = &first.trim()[..20];
+    let out = run(&["ws", "restore", "w", prefix], None);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(lines[0].starts_with("saved w first as snapshot "), "{out}");
+    assert!(
+        lines[1].starts_with(&format!("restored w to {}; now snapshot ", first.trim())),
+        "{out}"
+    );
+    assert_eq!(run(&["ws", "read", "w", "notes.txt"], None), "one\n");
+    assert_eq!(run(&["ws", "snapshots", "w"], None).lines().count(), 3);
+
+    let again = run(&["ws", "restore", "w", prefix], None);
+    assert_eq!(again, format!("w already matches {}\n", first.trim()));
+
+    let missing = peerfs(&space.path, "a", &["ws", "restore", "w", "01ffff"], None);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no snapshot 01ffff"));
+}

@@ -167,6 +167,25 @@ pub enum Error {
     /// A host name is empty or holds whitespace.
     #[error("invalid host {0:?}")]
     InvalidHost(String),
+    /// No snapshot of a workspace's current change starts with what was given.
+    #[error("workspace {workspace} has no snapshot {snapshot} in its current change")]
+    NoSuchSnapshot {
+        /// The workspace.
+        workspace: String,
+        /// What was given: a snapshot or the start of one.
+        snapshot: String,
+    },
+    /// More than one snapshot starts with what was given.
+    #[error("{0} is the start of more than one snapshot; give more of it")]
+    AmbiguousSnapshot(String),
+    /// A workspace moved onto a new base during its change, by a conflicted commit or a
+    /// merge, or holds a merge to resolve. Its earlier snapshots were taken over the old
+    /// base, so restoring one would undo what the new base brought.
+    #[error(
+        "workspace {0} moved onto a new base during this change, by a conflicted commit or a \
+         merge; restoring an earlier snapshot would undo that, so resolve and commit first"
+    )]
+    BaseMoved(String),
 }
 
 impl Error {

@@ -327,3 +327,59 @@ fn files_the_mount_holds_open_follow_changes_through_the_api() {
     assert_eq!(api_read("notes.txt"), "five\n");
     assert_eq!(fs::read_to_string(&notes).unwrap(), "five\n");
 }
+
+#[test]
+fn the_mount_shows_a_restored_snapshot() {
+    let Some(fixture) = fixture() else { return };
+    let root = &fixture.root;
+    let snapshot = || {
+        let mut space = fixture.space.lock().unwrap();
+        let mut ws = space.workspace("w").unwrap();
+        space
+            .snapshot_workspace(&mut ws, "step", &author())
+            .unwrap()
+            .unwrap()
+    };
+
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn one() {}\npub fn two() {}\n",
+    )
+    .unwrap();
+    let first = snapshot();
+    fs::write(root.join("src/lib.rs"), "pub fn three() {}\n").unwrap();
+    fs::write(root.join("extra.rs"), "// later\n").unwrap();
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(root.join("target/out"), "built\n").unwrap();
+    // Hold the file open across the restore, as an editor or a build would.
+    let held = fs::File::open(root.join("src/lib.rs")).unwrap();
+
+    {
+        let mut space = fixture.space.lock().unwrap();
+        let mut ws = space.workspace("w").unwrap();
+        space
+            .restore_workspace(&mut ws, &first.to_string(), &author())
+            .unwrap();
+    }
+    // The kernel may keep names and attributes for its TTL.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        "pub fn one() {}\npub fn two() {}\n"
+    );
+    assert!(!root.join("extra.rs").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("target/out")).unwrap(),
+        "built\n"
+    );
+    drop(held);
+
+    // Writing through the mount after a restore lands in the restored file.
+    fs::write(root.join("src/lib.rs"), "pub fn four() {}\n").unwrap();
+    let space = fixture.space.lock().unwrap();
+    let ws = space.workspace("w").unwrap();
+    assert_eq!(
+        ws.read(&space, "src/lib.rs").unwrap(),
+        b"pub fn four() {}\n"
+    );
+}

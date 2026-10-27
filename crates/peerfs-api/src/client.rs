@@ -16,8 +16,9 @@ use crate::wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
     HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, MountInfo,
-    PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision,
-    SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, RestoreRequest,
+    RestoreResponse, Revision, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo,
+    WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -607,6 +608,28 @@ impl Client {
         let path = format!("/v1/workspaces/{}/snapshot", segment(workspace));
         let request = SnapshotRequest {
             message: message.map(ToOwned::to_owned),
+            caller: caller.clone(),
+        };
+        self.json(Method::POST, &path, Some(&request)).await
+    }
+
+    /// Restores a workspace's source paths to one of its current change's snapshots, given
+    /// whole or by the start of its ID, snapshotting the workspace before and after.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `not_found` if there is no such workspace or snapshot, `invalid` if the
+    /// start matches more than one, or `conflict` once the change has moved onto a new base
+    /// or while a merge waits to be resolved.
+    pub async fn restore(
+        &self,
+        workspace: &str,
+        snapshot: &str,
+        caller: &Caller,
+    ) -> Result<RestoreResponse, ClientError> {
+        let path = format!("/v1/workspaces/{}/restore", segment(workspace));
+        let request = RestoreRequest {
+            snapshot: snapshot.to_owned(),
             caller: caller.clone(),
         };
         self.json(Method::POST, &path, Some(&request)).await

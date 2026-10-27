@@ -194,6 +194,14 @@ enum WorkspaceCommand {
     },
     /// List the snapshots of the workspace's current change, newest first.
     Snapshots { name: String },
+    /// Restore the workspace's source paths to one of its current change's snapshots.
+    /// Snapshots it first, so nothing is lost, and again after; derived and secret paths
+    /// stay as they are.
+    Restore {
+        name: String,
+        /// The snapshot, as `ws snapshots` lists it, or enough of its start to be unique.
+        snapshot: String,
+    },
     /// Commit the workspace's changes to its branch as one signed commit, replacing the
     /// change's snapshots.
     Commit {
@@ -498,6 +506,29 @@ async fn print_snapshots(client: &Client, name: &str, out: &mut impl Write) -> R
     Ok(())
 }
 
+/// `ws restore`: says what it saved first and what the workspace now holds.
+async fn restore(
+    client: &Client,
+    name: &str,
+    snapshot: &str,
+    caller: &Caller,
+    out: &mut impl Write,
+) -> Result<()> {
+    let restored = client.restore(name, snapshot, caller).await?;
+    if let Some(before) = restored.before {
+        writeln!(out, "saved {name} first as snapshot {before}")?;
+    }
+    match restored.snapshot {
+        Some(snapshot) => writeln!(
+            out,
+            "restored {name} to {}; now snapshot {snapshot}",
+            restored.target
+        )?,
+        None => writeln!(out, "{name} already matches {}", restored.target)?,
+    }
+    Ok(())
+}
+
 /// `ws commit`: exits 1 on a conflict.
 async fn commit(
     client: &Client,
@@ -603,6 +634,9 @@ async fn workspace(
             }
         }
         WorkspaceCommand::Snapshots { name } => print_snapshots(client, &name, out).await?,
+        WorkspaceCommand::Restore { name, snapshot } => {
+            restore(client, &name, &snapshot, caller, out).await?;
+        }
         WorkspaceCommand::Commit { name, message } => {
             return commit(client, &name, &message, caller, out).await;
         }

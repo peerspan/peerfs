@@ -68,6 +68,17 @@ pub struct Space {
 /// Decoded trees kept before the cache starts over.
 const CACHED_TREES: usize = 16_384;
 
+/// What restoring a workspace to a snapshot did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Restored {
+    /// The snapshot restored.
+    pub target: ObjectId,
+    /// The snapshot that saved the workspace first, when it had changed since its last.
+    pub before: Option<ObjectId>,
+    /// The snapshot of the restored workspace; none when it already matched its last.
+    pub snapshot: Option<ObjectId>,
+}
+
 /// What committing a workspace did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1110,6 +1121,61 @@ impl Space {
         Ok(snapshots)
     }
 
+    /// Restores the workspace's source paths to one of its current change's snapshots,
+    /// given whole or by the start of its ID. The workspace is snapshotted first, so
+    /// nothing is lost, and again once restored, so the snapshots keep every step,
+    /// including the restore; restoring a later one goes forward again. Derived and secret
+    /// paths, which no snapshot holds, stay as they are. The base, branch and change do not
+    /// move.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::NoSuchSnapshot`] or [`Error::AmbiguousSnapshot`] when the
+    /// snapshot is not found once among the change's, with [`Error::BaseMoved`] once the
+    /// change has moved onto a new base or while a merge waits to be resolved, or on a
+    /// store or file system error.
+    pub fn restore_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        snapshot: &str,
+        author: &Author,
+    ) -> Result<Restored> {
+        let snapshots = self.snapshots(workspace)?;
+        // The base the change started from is the oldest snapshot's parent.
+        let started = snapshots
+            .last()
+            .and_then(|(_, oldest)| oldest.parents.first().copied());
+        if workspace.merging().is_some() || started.is_some_and(|base| base != workspace.base()) {
+            return Err(Error::BaseMoved(workspace.name().to_owned()));
+        }
+        let wanted = snapshot.trim();
+        let mut found = snapshots
+            .into_iter()
+            .filter(|(id, _)| !wanted.is_empty() && id.to_string().starts_with(wanted));
+        let (target, commit) = match (found.next(), found.next()) {
+            (Some(only), None) => only,
+            (Some(_), Some(_)) => return Err(Error::AmbiguousSnapshot(wanted.to_owned())),
+            (None, _) => {
+                return Err(Error::NoSuchSnapshot {
+                    workspace: workspace.name().to_owned(),
+                    snapshot: wanted.to_owned(),
+                });
+            }
+        };
+        let short = short_id(target);
+        let before =
+            self.snapshot_workspace(workspace, &format!("Before restoring {short}"), author)?;
+        let base = workspace.base();
+        let base_tree = self.commit(base)?.tree;
+        workspace.rebase(self, base, base_tree, commit.tree)?;
+        let snapshot = self.snapshot_workspace(workspace, &format!("Restore {short}"), author)?;
+        Ok(Restored {
+            target,
+            before,
+            snapshot,
+        })
+    }
+
     /// Commits the workspace's changes to its branch as one signed commit, ending the
     /// change. When the change has snapshots, a last one is taken and the commit names it
     /// as its predecessor. When the branch has moved, the changes are merged onto its head
@@ -1201,3 +1267,11 @@ fn branch_name(branch: &str) -> Result<Name> {
     }
     Ok(Name::try_from(branch)?)
 }
+
+/// The start of an ID, enough to name a snapshot in a message.
+fn short_id(id: ObjectId) -> String {
+    id.to_string().chars().take(SHORT_ID).collect()
+}
+
+/// Characters of an ID quoted in messages: the algorithm code and 14 hex digits.
+const SHORT_ID: usize = 16;
