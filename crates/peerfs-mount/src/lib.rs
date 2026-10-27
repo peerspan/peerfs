@@ -375,8 +375,9 @@ impl FileSystem for WorkspaceFs {
     type Inode = u64;
     type Handle = u64;
 
-    fn init(&self, _capable: FsOptions) -> io::Result<FsOptions> {
-        Ok(FsOptions::empty())
+    fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        // Writes of up to 1 MiB per request, instead of one request per page.
+        Ok(capable & (FsOptions::BIG_WRITES | FsOptions::MAX_PAGES))
     }
 
     fn lookup(&self, _ctx: &Context, parent: u64, name: &CStr) -> io::Result<FuseEntry> {
