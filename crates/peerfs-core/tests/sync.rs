@@ -67,6 +67,14 @@ impl Remote for Tampering<'_> {
     }
 }
 
+/// A new space on the host `laptop` that trusts `server`'s key for the host `server`.
+fn laptop_trusting(dir: &tempfile::TempDir, server: &Space) -> Space {
+    let mut laptop = Space::init(dir.path().join("laptop"), &author("laptop")).expect("init");
+    let key = server.public_key().expect("the space signs");
+    laptop.add_known_host("server", &key).expect("trust");
+    laptop
+}
+
 /// A space on `host` whose `main` has a few commits, including a chunked file.
 fn source(dir: &tempfile::TempDir, host: &str) -> Space {
     let mut space = Space::init(dir.path().join(host), &author(host)).expect("test setup");
@@ -126,7 +134,7 @@ fn exported(space: &Space, revision: &str, dir: &std::path::Path) -> Vec<(String
 fn a_pull_brings_the_whole_history_and_records_a_tracking_reference() {
     let dir = tempfile::tempdir().unwrap();
     let server = source(&dir, "server");
-    let mut laptop = Space::init(dir.path().join("laptop"), &author("laptop")).unwrap();
+    let mut laptop = laptop_trusting(&dir, &server);
 
     let pulled = laptop.pull(&mut Direct(&server), "server", "main").unwrap();
     let head = server.branch("main").unwrap().unwrap();
@@ -154,7 +162,7 @@ fn a_pull_brings_the_whole_history_and_records_a_tracking_reference() {
 fn a_second_pull_fetches_only_what_is_new() {
     let dir = tempfile::tempdir().unwrap();
     let mut server = source(&dir, "server");
-    let mut laptop = Space::init(dir.path().join("laptop"), &author("laptop")).unwrap();
+    let mut laptop = laptop_trusting(&dir, &server);
     laptop.pull(&mut Direct(&server), "server", "main").unwrap();
 
     let again = laptop.pull(&mut Direct(&server), "server", "main").unwrap();
@@ -178,7 +186,7 @@ fn a_second_pull_fetches_only_what_is_new() {
 fn a_pull_cut_off_part_way_changes_no_reference_and_resumes() {
     let dir = tempfile::tempdir().unwrap();
     let server = source(&dir, "server");
-    let mut laptop = Space::init(dir.path().join("laptop"), &author("laptop")).unwrap();
+    let mut laptop = laptop_trusting(&dir, &server);
 
     let mut flaky = Flaky {
         inner: Direct(&server),
@@ -202,7 +210,7 @@ fn tampered_or_missing_objects_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let server = source(&dir, "server");
 
-    let mut laptop = Space::init(dir.path().join("laptop"), &author("laptop")).unwrap();
+    let mut laptop = laptop_trusting(&dir, &server);
     let mut flipped = Tampering {
         inner: Direct(&server),
         edit: |objects| {
@@ -244,10 +252,45 @@ fn tampered_or_missing_objects_are_refused() {
 }
 
 #[test]
-fn a_missing_remote_branch_is_reported() {
+fn commits_from_a_host_whose_key_is_not_trusted_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let server = source(&dir, "server");
     let mut laptop = Space::init(dir.path().join("laptop"), &author("laptop")).unwrap();
+    let objects_before = laptop.object_count();
+
+    let refused = laptop.pull(&mut Direct(&server), "server", "main");
+    let Err(Error::UnknownHostKey { host, key, .. }) = refused else {
+        panic!("expected the pull to be refused, got {refused:?}");
+    };
+    assert_eq!(host, "server");
+    assert_eq!(Some(key), server.public_key());
+    assert_eq!(laptop.resolve("server/main").unwrap(), None);
+    assert_eq!(laptop.object_count(), objects_before, "nothing stored");
+
+    // A key trusted for another host does not vouch for this one.
+    laptop.add_known_host("elsewhere", &key).unwrap();
+    assert!(matches!(
+        laptop.pull(&mut Direct(&server), "server", "main"),
+        Err(Error::UnknownHostKey { .. })
+    ));
+
+    assert!(laptop.add_known_host("server", &key).unwrap());
+    assert!(
+        !laptop.add_known_host("server", &key).unwrap(),
+        "already listed"
+    );
+    laptop.pull(&mut Direct(&server), "server", "main").unwrap();
+    assert_eq!(
+        laptop.resolve("server/main").unwrap(),
+        server.branch("main").unwrap()
+    );
+}
+
+#[test]
+fn a_missing_remote_branch_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = source(&dir, "server");
+    let mut laptop = laptop_trusting(&dir, &server);
     assert!(matches!(
         laptop.pull(&mut Direct(&server), "server", "nope"),
         Err(Error::NoSuchBranch(_))

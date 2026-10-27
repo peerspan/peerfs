@@ -9,7 +9,7 @@ selectively is the broader one.
 
 The design and its agreed decisions are in `peerspan/docs-internal`, `docs/peerfs.md`.
 
-## Status: milestones 1 and 2, and slices 1 and 2 of 3a (pull, push and merge between spaces)
+## Status: milestones 1 and 2, and slices 1 to 3 of 3a (pull, push and merge between spaces, signed commits)
 
 What works today, on one host:
 
@@ -24,12 +24,13 @@ What works today, on one host:
 | Commit | Fast path when the branch has not moved; otherwise a three-way merge onto the new head. Text up to 1 MiB merges by line; a conflict commits nothing and leaves markers in the workspace to resolve | 2 |
 | Pull | Fetches another space's branch and its whole history, only the objects missing here, each checked against its identity and expected kind; records it as the tracking reference `<host>/<branch>`. The store stays closed (it holds an object only with everything it references), so an interrupted pull leaves no reference and resumes. Between spaces on one host for now; across hosts through the daemons in 3b | 3, 8 |
 | Push | Sends a branch to the space that holds it: asks which objects it lacks (a held object needs nothing beneath it sent), sends those children first, and the receiver refuses any object that does not match or references one it lacks. The home host moves its branch only by compare-and-swap against the head the pusher last pulled, and only as a fast-forward, so a push never drops commits it did not see | 2, 3 |
+| Signing | Every commit is signed with Ed25519 when stored; the signature covers a domain-separated encoding of the commit and is part of its identity. A commit pulled or pushed in is refused unless it is signed by a key listed for the host it names as its author. For now a space signs with its own `signing.key` and trusts the keys in its `hosts` file (`peerfs key`, `peerfs hosts add`); in 3b the host daemon signs and supplies peers' keys, behind the same `Signer` and `HostKeys` traits | 3, 9 |
 | Merge | `ws merge` brings a branch or `<host>/<branch>` into a workspace's branch: up to date, fast-forward, a clean merge commit with both parents, or conflict markers to resolve, after which the commit records both parents. A refused push is followed by pull, merge, push | 2 |
 | Server | `peerfs serve` owns the space and serves it at `<space>/peerfs.sock`, so concurrent agents serialize through it; it exits after an idle timeout, on SIGTERM and on `peerfs stop` | 4 |
 | API | HTTP/1.1 and JSON over the Unix socket, following the host daemon's `admin.sock` conventions; a Rust client in `peerfs-api` | 4, 9 |
-| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `pull`, `push`, `remotes`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / merge / discard` | 4 |
+| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `pull`, `push`, `remotes`, `key`, `hosts [add]`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / merge / discard` | 4 |
 
-Not yet: signing, replication between hosts and durability receipts, owner rules for
+Not yet: signing through the host daemon, replication between hosts and durability receipts, owner rules for
 conflicts (`regenerate`, `ours`/`theirs`, structured merge), source/derived/secret path
 classes, garbage collection, branch handoff, the local contract with the Peerspan host
 daemon, and the FUSE, NFS and VM frontends. Files are read and written whole in memory,
@@ -39,7 +40,7 @@ and the server applies requests one at a time. Linux and macOS only.
 
 `peerfs serve` listens on `<space>/peerfs.sock` (mode 0600) and writes `<space>/serve.pid`.
 Requests and responses are JSON under `/v1`; errors are `{"code", "error"}` with `invalid`
-(400), `not_found` (404), `conflict` (409), `remote` (502, another host failed or sent
+(400), `forbidden` (403, a commit signed by a key not listed for its host), `not_found` (404), `conflict` (409), `remote` (502, another host failed or sent
 something unusable) or `internal` (500); unknown fields are rejected. Wherever a branch is
 named, `<host>/<branch>` names a tracking reference.
 File contents are raw bodies. Commits record the server's host and the agent and session
@@ -47,7 +48,7 @@ the request names.
 
 | Route | Does |
 | --- | --- |
-| `GET /v1/space` | The space's path, host and object count |
+| `GET /v1/space` | The space's path, host, object count and signing key |
 | `GET, POST /v1/branches` | List branches; fork one (`{name, from}`) |
 | `GET /v1/branches/{name}/log?limit=N` | History, newest first |
 | `POST /v1/import`, `POST /v1/export` | Commit a directory onto a branch; write a revision to a directory (absolute paths on the server's host) |
@@ -60,6 +61,7 @@ the request names.
 | `POST /v1/objects/fetch` | Objects by id (`{ids}`, at most 256), as `application/octet-stream`; those not held are left out |
 | `POST /v1/pull` | Pull a branch from another server (`{from, branch}`, `from` its socket); the space is held only between fetches |
 | `GET /v1/remotes` | Tracking references, with when each was pulled |
+| `GET, POST /v1/hosts` | Keys trusted to sign other hosts' commits; add one (`{host, key}`, the key in standard Base64) |
 | `POST /v1/objects/have` | Which of these objects (`{ids}`, at most 256) the space holds |
 | `POST /v1/objects/receive` | Store objects (`application/octet-stream`), each after everything it references |
 | `POST /v1/branches/{name}/advance` | Move a branch (`{expected, new}`) by compare-and-swap, fast-forward only |
@@ -90,7 +92,7 @@ peerfs ws read agent-2 notes.txt
 | `crates/peerfs-server` | The server: one space behind the API |
 | `crates/peerfs` | The command-line interface, a client of the server |
 
-A space on disk is `FORMAT`, `HOST` (the host given at `init`), `objects/pack-*.pack`, `refs/branches/<name>`, `refs/remotes/<host>/<branch>`, and
+A space on disk is `FORMAT`, `HOST` (the host given at `init`), `signing.key` (mode 0600), `hosts`, `objects/pack-*.pack`, `refs/branches/<name>`, `refs/remotes/<host>/<branch>`, and
 `workspaces/<name>/` (`state`, `whiteouts`, `upper/`), and while a server runs,
 `peerfs.sock`, `serve.pid` and its log `serve.log`.
 

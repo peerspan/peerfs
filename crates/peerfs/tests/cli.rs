@@ -227,3 +227,37 @@ fn alive(pid: &str) -> bool {
         .status()
         .is_ok_and(|status| status.success())
 }
+
+#[test]
+fn a_pull_needs_the_other_spaces_key_which_key_prints_for_hosts_add() {
+    let ours = new_space();
+    let theirs = new_space();
+    let theirs_path = theirs.path.to_str().expect("UTF-8 path");
+
+    let refused = peerfs(&ours.path, "a", &["pull", theirs_path], None);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("not a known key of host test-host"),
+        "{stderr}"
+    );
+
+    let key_line = ok(&peerfs(&theirs.path, "a", &["key"], None));
+    let (host, key) = key_line
+        .trim()
+        .split_once(' ')
+        .expect("`key` prints `<host> <key>`");
+    assert_eq!(host, "test-host");
+    ok(&peerfs(&ours.path, "a", &["hosts", "add", host, key], None));
+    assert_eq!(ok(&peerfs(&ours.path, "a", &["hosts"], None)), key_line);
+
+    ok(&peerfs(&ours.path, "a", &["pull", theirs_path], None));
+    let log = ok(&peerfs(
+        &ours.path,
+        "a",
+        &["log", "--branch", "test-host/main"],
+        None,
+    ));
+    assert!(log.contains("Create the space"), "{log}");
+    assert!(!log.contains("unsigned"), "{log}");
+}

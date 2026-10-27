@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErrorBody {
-    /// `invalid`, `not_found`, `conflict` or `internal`.
+    /// `invalid`, `not_found`, `conflict`, `forbidden`, `remote` or `internal`.
     pub code: String,
     /// What went wrong. Internal errors say only `internal error`.
     pub error: String,
@@ -25,6 +25,20 @@ pub struct SpaceInfo {
     pub host: String,
     /// The number of objects stored.
     pub objects: u64,
+    /// The key the space signs its commits with, in standard Base64, if it signs them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// A key trusted to sign another host's commits: an entry of `GET /v1/hosts`, and the body
+/// of `POST /v1/hosts`, which adds one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostKey {
+    /// The host, as commits name their author's host.
+    pub host: String,
+    /// Its Ed25519 public key, in standard Base64.
+    pub key: String,
 }
 
 /// A branch and the commit it points at.
@@ -83,6 +97,9 @@ pub struct CommitInfo {
     pub time_ms: u64,
     /// Its message.
     pub message: String,
+    /// The key that signed it, in standard Base64; absent for an unsigned commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
 }
 
 /// `POST /v1/import`: commit a directory on the server's host onto a branch.

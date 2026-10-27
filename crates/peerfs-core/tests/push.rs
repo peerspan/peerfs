@@ -1,8 +1,8 @@
 //! Pushing to a branch's home host, and merging another host's work back.
 
 use peerfs_core::{
-    Author, CommitOutcome, ConflictKind, Error, MergeOutcome, ObjectId, RawObject, Remote, Result,
-    Space,
+    Author, CommitOutcome, ConflictKind, Error, Kind, MergeOutcome, ObjectId, RawObject, Remote,
+    Result, Space,
 };
 
 fn author(host: &str) -> Author {
@@ -50,13 +50,13 @@ fn send(from: &Space, to: &mut Space, head: ObjectId) -> Vec<RawObject> {
     objects
 }
 
-fn commit(space: &mut Space, workspace: &str, files: &[(&str, &str)]) -> ObjectId {
+fn commit(space: &mut Space, host: &str, workspace: &str, files: &[(&str, &str)]) -> ObjectId {
     let mut ws = space.workspace(workspace).expect("workspace");
     for (path, text) in files {
         ws.write(space, path, text.as_bytes()).expect("write");
     }
     match space
-        .commit_workspace(&mut ws, "work", &author("test"))
+        .commit_workspace(&mut ws, "work", &author(host))
         .expect("commit")
     {
         CommitOutcome::Committed { commit, .. } => commit,
@@ -64,16 +64,26 @@ fn commit(space: &mut Space, workspace: &str, files: &[(&str, &str)]) -> ObjectI
     }
 }
 
-/// A server whose main has a file, and a laptop that pulled it and forked `work`.
+/// Lets `space` accept commits `other` signs as `host`.
+fn trust(space: &mut Space, host: &str, other: &Space) {
+    let key = other.public_key().expect("the space signs");
+    space.add_known_host(host, &key).expect("trust");
+}
+
+/// A server whose main has a file, and a laptop that pulled it and forked `work`. Each
+/// trusts the other's key.
 fn pair(dir: &tempfile::TempDir) -> (Space, Space) {
     let mut server = Space::init(dir.path().join("server"), &author("server")).expect("init");
     server.create_workspace("w", "main").expect("workspace");
     commit(
         &mut server,
+        "server",
         "w",
         &[("shared.txt", "one\ntwo\nthree\nfour\nfive\n")],
     );
     let mut laptop = Space::init(dir.path().join("laptop"), &author("laptop")).expect("init");
+    trust(&mut laptop, "server", &server);
+    trust(&mut server, "laptop", &laptop);
     laptop
         .pull(&mut Direct(&server), "server", "main")
         .expect("pull");
@@ -91,7 +101,12 @@ fn a_push_sends_only_missing_objects_and_fast_forwards_the_home_branch() {
     let dir = tempfile::tempdir().unwrap();
     let (mut server, mut laptop) = pair(&dir);
     let server_head = server.branch("main").unwrap();
-    let mine = commit(&mut laptop, "w", &[("new.txt", "from the laptop\n")]);
+    let mine = commit(
+        &mut laptop,
+        "laptop",
+        "w",
+        &[("new.txt", "from the laptop\n")],
+    );
 
     let sent = send(&laptop, &mut server, mine);
     // The commit, the root tree and the new file: nothing the server had.
@@ -115,8 +130,18 @@ fn the_home_host_refuses_a_push_that_would_drop_commits() {
     let dir = tempfile::tempdir().unwrap();
     let (mut server, mut laptop) = pair(&dir);
     let seen = server.branch("main").unwrap();
-    let theirs = commit(&mut server, "w", &[("server.txt", "server work\n")]);
-    let mine = commit(&mut laptop, "w", &[("laptop.txt", "laptop work\n")]);
+    let theirs = commit(
+        &mut server,
+        "server",
+        "w",
+        &[("server.txt", "server work\n")],
+    );
+    let mine = commit(
+        &mut laptop,
+        "laptop",
+        "w",
+        &[("laptop.txt", "laptop work\n")],
+    );
     send(&laptop, &mut server, mine);
 
     // Against the head the laptop last saw: the branch moved.
@@ -136,7 +161,7 @@ fn the_home_host_refuses_a_push_that_would_drop_commits() {
 fn receiving_refuses_objects_that_would_leave_a_hole() {
     let dir = tempfile::tempdir().unwrap();
     let (mut server, mut laptop) = pair(&dir);
-    let mine = commit(&mut laptop, "w", &[("new.txt", "x\n")]);
+    let mine = commit(&mut laptop, "laptop", "w", &[("new.txt", "x\n")]);
 
     // The commit alone, without the tree it references.
     let commit_only = vec![laptop.raw_object(mine).unwrap().unwrap()];
@@ -173,7 +198,7 @@ fn merging_another_hosts_branch_fast_forwards_or_merges_cleanly() {
     );
 
     // Only the server moved: a fast-forward.
-    let theirs = commit(&mut server, "w", &[("a.txt", "a\n")]);
+    let theirs = commit(&mut server, "server", "w", &[("a.txt", "a\n")]);
     laptop.pull(&mut Direct(&server), "server", "main").unwrap();
     let mut ws = laptop.workspace("w").unwrap();
     assert_eq!(
@@ -186,11 +211,13 @@ fn merging_another_hosts_branch_fast_forwards_or_merges_cleanly() {
     // Both moved, on different lines: a merge commit with both parents.
     commit(
         &mut server,
+        "server",
         "w",
         &[("shared.txt", "ONE\ntwo\nthree\nfour\nfive\n")],
     );
     let mine = commit(
         &mut laptop,
+        "laptop",
         "w",
         &[("shared.txt", "one\ntwo\nthree\nfour\nFIVE\n")],
     );
@@ -223,8 +250,18 @@ fn merging_another_hosts_branch_fast_forwards_or_merges_cleanly() {
 fn a_conflicted_merge_is_resolved_in_the_workspace_with_both_parents() {
     let dir = tempfile::tempdir().unwrap();
     let (mut server, mut laptop) = pair(&dir);
-    commit(&mut server, "w", &[("shared.txt", "server's line\n")]);
-    let mine = commit(&mut laptop, "w", &[("shared.txt", "laptop's line\n")]);
+    commit(
+        &mut server,
+        "server",
+        "w",
+        &[("shared.txt", "server's line\n")],
+    );
+    let mine = commit(
+        &mut laptop,
+        "laptop",
+        "w",
+        &[("shared.txt", "laptop's line\n")],
+    );
     laptop.pull(&mut Direct(&server), "server", "main").unwrap();
     let server_head = laptop.resolve("server/main").unwrap().unwrap();
 
@@ -267,4 +304,86 @@ fn a_conflicted_merge_is_resolved_in_the_workspace_with_both_parents() {
         laptop.merge_base(commit, server_head).unwrap(),
         Some(server_head)
     );
+}
+
+#[test]
+fn the_home_host_refuses_commits_not_signed_by_their_hosts_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut server, mut laptop) = pair(&dir);
+    let objects_for = |laptop: &Space, head: ObjectId, server: &Space| -> Vec<RawObject> {
+        let mut push = laptop.start_push(head).unwrap();
+        loop {
+            let ask = push.to_ask();
+            if ask.is_empty() {
+                break;
+            }
+            laptop.answer_push(&mut push, &server.have(&ask)).unwrap();
+        }
+        laptop
+            .push_order(&push)
+            .unwrap()
+            .into_iter()
+            .map(|id| laptop.raw_object(id).unwrap().unwrap())
+            .collect()
+    };
+    // Each case works on its own branch from the server's main, so none sends another's
+    // commits.
+    let base = laptop.resolve("server/main").unwrap().unwrap();
+    for name in ["forged", "unsigned", "tampered"] {
+        laptop.create_branch(name, base).unwrap();
+        laptop.create_workspace(name, name).unwrap();
+    }
+
+    // Signed by the laptop's key but naming the server as its author.
+    let forged = commit(&mut laptop, "server", "forged", &[("a.txt", "a\n")]);
+    let objects = objects_for(&laptop, forged, &server);
+    let Err(Error::UnknownHostKey {
+        commit: refused,
+        host,
+        key,
+    }) = server.accept_objects(&objects)
+    else {
+        panic!("expected the commit to be refused");
+    };
+    assert_eq!((refused, host.as_str()), (forged, "server"));
+    assert_eq!(Some(key), laptop.public_key());
+    assert!(!server.have(&[forged])[0]);
+
+    // Unsigned.
+    laptop.set_signer(None);
+    let unsigned = commit(&mut laptop, "laptop", "unsigned", &[("b.txt", "b\n")]);
+    assert_eq!(laptop.commit(unsigned).unwrap().signature, None);
+    let objects = objects_for(&laptop, unsigned, &server);
+    assert!(matches!(
+        server.accept_objects(&objects),
+        Err(Error::RemoteObject {
+            problem: "is a commit without a signature",
+            ..
+        })
+    ));
+
+    // A signature that does not cover the commit, under a matching identity.
+    let mut laptop = {
+        drop(laptop);
+        Space::open(dir.path().join("laptop")).unwrap()
+    };
+    let signed = commit(&mut laptop, "laptop", "tampered", &[("c.txt", "c\n")]);
+    let mut objects = objects_for(&laptop, signed, &server);
+    let last = objects.last_mut().unwrap();
+    assert_eq!(last.kind, Kind::Commit);
+    let end = last.bytes.len() - 1;
+    last.bytes[end] ^= 1;
+    last.id = ObjectId::compute(Kind::Commit, &last.bytes);
+    assert!(matches!(
+        server.accept_objects(&objects),
+        Err(Error::RemoteObject {
+            problem: "is a commit whose signature does not verify",
+            ..
+        })
+    ));
+
+    // The same commit, untampered, is accepted.
+    let objects = objects_for(&laptop, signed, &server);
+    server.accept_objects(&objects).unwrap();
+    assert!(server.have(&[signed])[0]);
 }

@@ -15,10 +15,12 @@ peerfs-server = { path = "crates/peerfs-server" }
 
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+base64 = "0.22"
 blake3 = "1.8"
 bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 diffy = "0.5"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "fast", "zeroize"] }
 fastcdc = "5"
 getrandom = "0.4"
 http-body-util = "0.1"

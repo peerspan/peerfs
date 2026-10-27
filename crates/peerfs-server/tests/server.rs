@@ -47,6 +47,18 @@ async fn start_on(host: &str, idle_timeout: Option<Duration>) -> Running {
     }
 }
 
+/// Has each server trust the other's key for the other's host, through the API.
+async fn introduce(a: &Running, b: &Running) {
+    for (from, to) in [(a, b), (b, a)] {
+        let space = from.client.space().await.expect("space info");
+        let key = space.key.expect("the space signs");
+        to.client
+            .add_host(&space.host, &key)
+            .await
+            .expect("add host");
+    }
+}
+
 fn caller(agent: &str) -> Caller {
     Caller {
         agent: Some(agent.to_owned()),
@@ -128,6 +140,14 @@ async fn concurrent_agents_all_commit_through_one_server() {
         .await
         .unwrap();
 
+    // Every workspace starts at the setup commit. Each agent writes the whole file from
+    // `lines`, so a workspace created after another agent committed would revert that edit.
+    for i in 0..agents {
+        client
+            .create_workspace(&format!("agent-{i}"), "main")
+            .await
+            .unwrap();
+    }
     let mut tasks = Vec::new();
     for i in 0..agents {
         let client = client.clone();
@@ -135,7 +155,6 @@ async fn concurrent_agents_all_commit_through_one_server() {
         mine[i] = format!("line {i} edited by agent {i}\nunchanged\nunchanged\n");
         tasks.push(tokio::spawn(async move {
             let name = format!("agent-{i}");
-            client.create_workspace(&name, "main").await.unwrap();
             client
                 .write(&name, &format!("agents/{i}.txt"), format!("from {i}\n"))
                 .await
@@ -278,6 +297,7 @@ async fn commit_files(client: &Client, workspace: &str, files: &[(&str, &str)]) 
 async fn a_server_pulls_another_servers_branch_and_works_from_it() {
     let server = start_on("server", None).await;
     let laptop = start_on("laptop", None).await;
+    introduce(&server, &laptop).await;
     commit_files(
         &server.client,
         "w",
@@ -317,6 +337,7 @@ async fn a_server_pulls_another_servers_branch_and_works_from_it() {
 async fn two_servers_pulling_from_each_other_at_once_both_finish() {
     let a = start_on("host-a", None).await;
     let b = start_on("host-b", None).await;
+    introduce(&a, &b).await;
     let many: Vec<(String, String)> = (0..600)
         .map(|i| (format!("f/{i}.txt"), format!("file {i}\n")))
         .collect();
@@ -361,6 +382,7 @@ async fn pull_and_fetch_reject_bad_requests() {
 async fn push_is_refused_when_the_home_moved_then_pull_merge_and_push_again() {
     let server = start_on("server", None).await;
     let laptop = start_on("laptop", None).await;
+    introduce(&server, &laptop).await;
     commit_files(
         &server.client,
         "w",
@@ -453,6 +475,8 @@ async fn two_hosts_pushing_to_one_home_at_once_cannot_both_win() {
     let server = start_on("server", None).await;
     let first = start_on("first", None).await;
     let second = start_on("second", None).await;
+    introduce(&server, &first).await;
+    introduce(&server, &second).await;
     commit_files(&server.client, "w", &[("base.txt", "base\n")]).await;
     let server_socket = server.client.socket().to_str().unwrap().to_owned();
     for (laptop, file) in [(&first, "first.txt"), (&second, "second.txt")] {
@@ -474,4 +498,68 @@ async fn two_hosts_pushing_to_one_home_at_once_cannot_both_win() {
     assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "{a:?} {b:?}");
     let loser = if a.is_ok() { b } else { a };
     assert_eq!(loser.unwrap_err().code(), Some("conflict"));
+}
+
+#[tokio::test]
+async fn commits_from_an_untrusted_host_are_forbidden_until_its_key_is_added() {
+    let server = start_on("server", None).await;
+    let laptop = start_on("laptop", None).await;
+    commit_files(&server.client, "w", &[("a.txt", "a\n")]).await;
+    let server_socket = server.client.socket().to_str().unwrap().to_owned();
+    let server_info = server.client.space().await.unwrap();
+    let server_key = server_info.key.expect("the space signs");
+    assert!(laptop.client.hosts().await.unwrap().is_empty());
+
+    let refused = laptop
+        .client
+        .pull(&server_socket, "main")
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Some("forbidden"), "{refused}");
+    assert!(refused.to_string().contains(&server_key), "{refused}");
+    assert!(laptop.client.remotes().await.unwrap().is_empty());
+
+    let bad = laptop
+        .client
+        .add_host("server", "not a key")
+        .await
+        .unwrap_err();
+    assert_eq!(bad.code(), Some("invalid"));
+    let spaced = laptop
+        .client
+        .add_host("two words", &server_key)
+        .await
+        .unwrap_err();
+    assert_eq!(spaced.code(), Some("invalid"));
+    laptop.client.add_host("server", &server_key).await.unwrap();
+    let hosts = laptop.client.hosts().await.unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(
+        (hosts[0].host.as_str(), hosts[0].key.as_str()),
+        ("server", server_key.as_str())
+    );
+
+    let pulled = laptop.client.pull(&server_socket, "main").await.unwrap();
+    let log = laptop.client.log("server/main", None).await.unwrap();
+    assert_eq!(log[0].id, pulled.head);
+    assert!(
+        log.iter()
+            .all(|commit| commit.signed_by.as_deref() == Some(server_key.as_str()))
+    );
+
+    // The server has not added the laptop's key, so it refuses the laptop's push.
+    laptop.client.fork("work", "server/main").await.unwrap();
+    laptop.client.create_workspace("lw", "work").await.unwrap();
+    commit_files(&laptop.client, "lw", &[("b.txt", "b\n")]).await;
+    let refused = laptop
+        .client
+        .push(&server_socket, "main", "work")
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("not a known key of host laptop"),
+        "{refused}"
+    );
 }

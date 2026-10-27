@@ -15,7 +15,7 @@ use tokio::net::UnixStream;
 use crate::wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
-    HaveRequest, HaveResponse, ImportRequest, MergeRequest, MergeResponse, PullRequest,
+    HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, PullRequest,
     PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision, SpaceInfo, TrackingInfo,
     WorkspaceInfo,
 };
@@ -311,6 +311,28 @@ impl Client {
             branch: branch.to_owned(),
         };
         self.json(Method::POST, "/v1/pull", Some(&request)).await
+    }
+
+    /// The keys this space trusts to sign other hosts' commits.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server cannot be reached or answers with an error.
+    pub async fn hosts(&self) -> Result<Vec<HostKey>, ClientError> {
+        self.json(Method::GET, "/v1/hosts", None::<&()>).await
+    }
+
+    /// Trusts `key`, in standard Base64, to sign commits that name `host` as their author.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `invalid` for a malformed key or a host that is empty or holds whitespace.
+    pub async fn add_host(&self, host: &str, key: &str) -> Result<HostKey, ClientError> {
+        let request = HostKey {
+            host: host.to_owned(),
+            key: key.to_owned(),
+        };
+        self.json(Method::POST, "/v1/hosts", Some(&request)).await
     }
 
     /// Every tracking reference: other hosts' branch heads as of their last pull.

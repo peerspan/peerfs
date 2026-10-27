@@ -15,13 +15,20 @@ use crate::object::{
 };
 use crate::path::TreePath;
 use crate::refs::Refs;
+use crate::sign::{HostKeys, KeyFile, KnownHosts, PublicKey, Signer, sign_commit};
 use crate::store::{Store, sync_dir};
 use crate::sync::{Pull, Pulled, Push, RawObject, Remote, Tracking, TrackingRefs, accept_objects};
 use crate::workspace::Workspace;
 use std::collections::{HashSet, VecDeque};
 
 /// The first line of a space's `FORMAT` file.
-const FORMAT: &str = "peerfs space 1";
+const FORMAT: &str = "peerfs space 2";
+
+/// The space's signing key, until the host daemon signs for it.
+const KEY_FILE: &str = "signing.key";
+
+/// The keys this space trusts for other hosts, until the host daemon supplies them.
+const HOSTS_FILE: &str = "hosts";
 
 /// Files smaller than this are stored whole.
 const WHOLE_FILE_LIMIT: usize = 64 * 1024;
@@ -34,13 +41,17 @@ pub const DEFAULT_BRANCH: &str = "main";
 
 /// One project's objects, branches and workspaces.
 ///
-/// A process holds a space exclusively while it is open.
+/// A process holds a space exclusively while it is open. Commits it stores are signed by
+/// its [`Signer`], and commits other hosts send must be signed by a key its [`HostKeys`]
+/// know for their author's host.
 #[derive(Debug)]
 pub struct Space {
     dir: PathBuf,
     store: Store,
     refs: Refs,
     tracking: TrackingRefs,
+    signer: Option<Box<dyn Signer>>,
+    host_keys: Box<dyn HostKeys>,
     _lock: File,
 }
 
@@ -100,7 +111,7 @@ fn lock_path(dir: &Path) -> PathBuf {
 
 impl Space {
     /// Creates a space in `dir`, which must not exist or be empty, with a `main` branch at
-    /// an empty first commit.
+    /// an empty first commit, and a new signing key.
     ///
     /// # Errors
     ///
@@ -121,6 +132,7 @@ impl Space {
         }
         let format = dir.join("FORMAT");
         fs::write(&format, format!("{FORMAT}\n")).map_err(|e| Error::io("writing", format, e))?;
+        KeyFile::create(&dir.join(KEY_FILE))?;
         sync_dir(dir)?;
 
         let mut space = Self::open(dir)?;
@@ -132,12 +144,15 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: "Create the space".to_owned(),
+            signature: None,
         })?;
         space.create_branch(DEFAULT_BRANCH, commit)?;
         Ok(space)
     }
 
-    /// Opens the space in `dir`.
+    /// Opens the space in `dir`. It signs with the key in its `signing.key` and trusts the
+    /// host keys in its `hosts` file until told otherwise; without a key, it stores
+    /// commits unsigned, and other hosts refuse them.
     ///
     /// # Errors
     ///
@@ -172,13 +187,55 @@ impl Space {
             }
             Err(fs::TryLockError::Error(e)) => return Err(Error::io("locking", lock_path, e)),
         }
+        let key_path = dir.join(KEY_FILE);
+        let signer: Option<Box<dyn Signer>> = if key_path.exists() {
+            Some(Box::new(KeyFile::load(&key_path)?))
+        } else {
+            None
+        };
         Ok(Self {
             dir: dir.to_owned(),
             store: Store::open(&dir.join("objects"))?,
             refs: Refs::new(dir.join("refs/branches")),
             tracking: TrackingRefs::new(dir.join("refs/remotes")),
+            signer,
+            host_keys: Box::new(KnownHosts::new(dir.join(HOSTS_FILE))),
             _lock: lock,
         })
+    }
+
+    /// Signs commits stored from now on with `signer`, or leaves them unsigned.
+    pub fn set_signer(&mut self, signer: Option<Box<dyn Signer>>) {
+        self.signer = signer;
+    }
+
+    /// Checks commits other hosts send against `host_keys` from now on.
+    pub fn set_host_keys(&mut self, host_keys: Box<dyn HostKeys>) {
+        self.host_keys = host_keys;
+    }
+
+    /// The key this space's commits are signed with, if it signs them.
+    pub fn public_key(&self) -> Option<PublicKey> {
+        self.signer.as_ref().map(|signer| signer.public_key())
+    }
+
+    /// The host keys listed in the space's `hosts` file.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be read or is malformed.
+    pub fn known_hosts(&self) -> Result<Vec<(String, PublicKey)>> {
+        KnownHosts::new(self.dir.join(HOSTS_FILE)).list()
+    }
+
+    /// Lists `key` in the space's `hosts` file as a key of `host`. Returns whether it was
+    /// new.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `host` is empty or holds whitespace, or on a file system error.
+    pub fn add_known_host(&mut self, host: &str, key: &PublicKey) -> Result<bool> {
+        KnownHosts::new(self.dir.join(HOSTS_FILE)).add(host, key)
     }
 
     /// The space's directory.
@@ -256,7 +313,7 @@ impl Space {
     ///
     /// Fails if a wanted object is missing or does not match, or on a store error.
     pub fn receive(&mut self, pull: &mut Pull, objects: Vec<RawObject>) -> Result<()> {
-        pull.receive(&mut self.store, objects)
+        pull.receive(&mut self.store, &*self.host_keys, objects)
     }
 
     /// Completes a pull once nothing is wanted: stores what was held back, makes it
@@ -314,7 +371,7 @@ impl Space {
     /// Fails with [`Error::RemoteObject`] at the first object refused; those before it are
     /// kept.
     pub fn accept_objects(&mut self, objects: &[RawObject]) -> Result<u64> {
-        accept_objects(&mut self.store, objects)
+        accept_objects(&mut self.store, &*self.host_keys, objects)
     }
 
     /// Moves `branch` from `expected` to `new` (`None`: creates it), as the branch's home
@@ -466,6 +523,7 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: format!("Merge {revision}"),
+            signature: None,
         })?;
         self.update_branch(&branch, Some(head), commit)?;
         workspace.reset(commit)?;
@@ -543,13 +601,20 @@ impl Space {
         })
     }
 
-    /// Stores a commit. Its tree and parents should be stored first.
+    /// Stores a commit, signed by the space's signer if it has one. Its tree and parents
+    /// should be stored first.
     ///
     /// # Errors
     ///
-    /// Fails on a file system error.
+    /// Fails if the signer fails, or on a file system error.
     pub fn put_commit(&mut self, commit: &Commit) -> Result<ObjectId> {
-        self.store.put(Kind::Commit, &commit.encode())
+        match &self.signer {
+            Some(signer) => {
+                let commit = sign_commit(commit, signer.as_ref())?;
+                self.store.put(Kind::Commit, &commit.encode())
+            }
+            None => self.store.put(Kind::Commit, &commit.encode()),
+        }
     }
 
     /// Reads a commit.
@@ -722,6 +787,7 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: message.to_owned(),
+            signature: None,
         })?;
         self.update_branch(branch, Some(head), commit)?;
         Ok(commit)
@@ -946,6 +1012,7 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: message.to_owned(),
+            signature: None,
         })?;
         self.update_branch(&branch, Some(head), commit)?;
         workspace.reset(commit)?;

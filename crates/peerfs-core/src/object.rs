@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::codec::{DecodeError, Decoder, Encoder};
 use crate::id::ObjectId;
+use crate::sign::{PUBLIC_KEY_LEN, PublicKey, SIGNATURE_LEN, SIGNING_CONTEXT, Signature};
 
 /// What an object is. Each kind hashes under its own context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -397,9 +398,14 @@ pub struct Commit {
     pub time: SystemTime,
     /// Free text describing it.
     pub message: String,
+    /// The authoring host's signature, which the space adds when it stores the commit.
+    pub signature: Option<Signature>,
 }
 
-const COMMIT_FORMAT: u8 = 1;
+const COMMIT_FORMAT: u8 = 2;
+
+/// The signature algorithm code: Ed25519, the only one.
+const ED25519: u8 = 1;
 
 fn encode_optional(out: &mut Encoder, value: Option<&str>) {
     match value {
@@ -424,6 +430,29 @@ fn decode_optional(input: &mut Decoder<'_>) -> Result<Option<String>, DecodeErro
 
 impl Commit {
     pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = self.encode_fields();
+        match &self.signature {
+            None => out.u8(0),
+            Some(signature) => {
+                out.u8(ED25519);
+                out.bytes(&signature.key.0);
+                out.bytes(&signature.bytes);
+            }
+        }
+        out.finish()
+    }
+
+    /// What the authoring host signs: [`SIGNING_CONTEXT`], then the commit's encoding
+    /// without a signature.
+    pub(crate) fn signing_message(&self) -> Vec<u8> {
+        let mut out = self.encode_fields();
+        out.u8(0);
+        let mut message = SIGNING_CONTEXT.to_vec();
+        message.extend(out.finish());
+        message
+    }
+
+    fn encode_fields(&self) -> Encoder {
         let millis = self
             .time
             .duration_since(UNIX_EPOCH)
@@ -442,7 +471,7 @@ impl Commit {
         encode_optional(&mut out, self.author.session.as_deref());
         out.u64(u64::try_from(millis).unwrap_or(u64::MAX));
         out.str(&self.message);
-        out.finish()
+        out
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
@@ -471,6 +500,25 @@ impl Commit {
         };
         let time = UNIX_EPOCH + Duration::from_millis(input.u64()?);
         let message = input.string()?;
+        let signature = match input.u8()? {
+            0 => None,
+            ED25519 => {
+                let key = <[u8; PUBLIC_KEY_LEN]>::try_from(input.bytes()?)
+                    .map_err(|_| DecodeError::Invalid("key is not 32 bytes".to_owned()))?;
+                let bytes = <[u8; SIGNATURE_LEN]>::try_from(input.bytes()?)
+                    .map_err(|_| DecodeError::Invalid("signature is not 64 bytes".to_owned()))?;
+                Some(Signature {
+                    key: PublicKey(key),
+                    bytes,
+                })
+            }
+            tag => {
+                return Err(DecodeError::Tag {
+                    what: "signature",
+                    tag,
+                });
+            }
+        };
         input.finish()?;
         Ok(Self {
             tree,
@@ -479,6 +527,7 @@ impl Commit {
             author,
             time,
             message,
+            signature,
         })
     }
 }
@@ -527,8 +576,17 @@ mod tests {
             },
             time: UNIX_EPOCH + Duration::from_millis(1_793_000_000_123),
             message: "edit".to_owned(),
+            signature: None,
         };
-        assert_eq!(Commit::decode(&commit.encode()), Ok(commit));
+        assert_eq!(Commit::decode(&commit.encode()), Ok(commit.clone()));
+        let signed = Commit {
+            signature: Some(Signature {
+                key: PublicKey([7; PUBLIC_KEY_LEN]),
+                bytes: [9; SIGNATURE_LEN],
+            }),
+            ..commit
+        };
+        assert_eq!(Commit::decode(&signed.encode()), Ok(signed));
     }
 
     #[test]

@@ -31,6 +31,7 @@ mod merge;
 mod object;
 mod path;
 mod refs;
+mod sign;
 mod space;
 mod store;
 mod sync;
@@ -44,6 +45,10 @@ pub use object::{
     Author, ChangeId, Commit, Content, Entry, FileMode, InvalidNameError, Kind, Name, Tree,
 };
 pub use path::TreePath;
+pub use sign::{
+    HostKeys, KeyFile, KnownHosts, PUBLIC_KEY_LEN, ParseKeyError, PublicKey, SIGNATURE_LEN,
+    SIGNING_CONTEXT, Signature, Signer,
+};
 pub use space::{CommitOutcome, DEFAULT_BRANCH, MergeOutcome, Merged, Space};
 pub use sync::{
     FETCH_BATCH, Pull, Pulled, Push, RawObject, Remote, Tracking, decode_objects, encode_objects,

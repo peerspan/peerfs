@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use crate::codec::DecodeError;
 use crate::id::ObjectId;
 use crate::object::{InvalidNameError, Kind};
+use crate::sign::PublicKey;
 
 /// A space operation that failed.
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +140,23 @@ pub enum Error {
         /// What was wrong.
         problem: &'static str,
     },
+    /// A commit another host sent is signed by a key not known to belong to its author's
+    /// host.
+    #[error("commit {commit} is signed by {key}, which is not a known key of host {host}")]
+    UnknownHostKey {
+        /// The commit.
+        commit: ObjectId,
+        /// The host it names as its author.
+        host: String,
+        /// The key that signed it.
+        key: PublicKey,
+    },
+    /// A commit could not be signed.
+    #[error("signing: {0}")]
+    Signing(String),
+    /// A host name is empty or holds whitespace.
+    #[error("invalid host {0:?}")]
+    InvalidHost(String),
 }
 
 impl Error {

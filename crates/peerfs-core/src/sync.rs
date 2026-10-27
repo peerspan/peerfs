@@ -5,6 +5,9 @@
 //! trees, trees before commits), and a crash only cuts off the newest records. So holding a
 //! commit means holding all of its history, and a pull fetches only what is missing.
 //!
+//! A commit from another host is accepted only when signed by a key of the host it names as
+//! its author; see [`crate::sign`].
+//!
 //! A pull stores fetched blobs as they arrive, since they reference nothing, and keeps the
 //! other objects in memory until everything they reach is stored, then stores them children
 //! first. The tracking reference is written last. A pull that fails part way leaves the
@@ -21,6 +24,7 @@ use crate::codec::{DecodeError, Decoder, Encoder, len_u64};
 use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::{ChunkList, Commit, Content, Entry, Kind, Name, Tree};
+use crate::sign::{HostKeys, verify_commit};
 use crate::store::{Store, sync_dir};
 
 /// The most objects asked for in one fetch.
@@ -107,6 +111,16 @@ pub fn decode_objects(bytes: &[u8]) -> Result<Vec<RawObject>, DecodeError> {
     }
     input.finish()?;
     Ok(objects)
+}
+
+/// Checks an object another host sent, beyond its identity: a commit must be signed by a
+/// key of its author's host.
+fn check_received(id: ObjectId, kind: Kind, bytes: &[u8], host_keys: &dyn HostKeys) -> Result<()> {
+    if kind == Kind::Commit {
+        let commit = Commit::decode(bytes).map_err(|source| Error::Decode { kind, id, source })?;
+        verify_commit(id, &commit, host_keys)?;
+    }
+    Ok(())
 }
 
 /// The objects an object refers to, with the kind each must be.
@@ -218,7 +232,12 @@ impl Pull {
         self.in_flight.iter().map(|(id, _)| *id).collect()
     }
 
-    pub(crate) fn receive(&mut self, store: &mut Store, objects: Vec<RawObject>) -> Result<()> {
+    pub(crate) fn receive(
+        &mut self,
+        store: &mut Store,
+        host_keys: &dyn HostKeys,
+        objects: Vec<RawObject>,
+    ) -> Result<()> {
         let mut got: HashMap<ObjectId, RawObject> = objects
             .into_iter()
             .map(|object| (object.id, object))
@@ -240,6 +259,7 @@ impl Pull {
                     problem: "does not match its identity",
                 });
             }
+            check_received(id, kind, &object.bytes, host_keys)?;
             self.objects += 1;
             self.bytes += len_u64(object.bytes.len());
             if kind == Kind::Blob {
@@ -428,8 +448,13 @@ impl Push {
 }
 
 /// Stores objects another host sent, in order, refusing any that does not match its
-/// identity or references an object not yet held, so the store stays closed.
-pub(crate) fn accept_objects(store: &mut Store, objects: &[RawObject]) -> Result<u64> {
+/// identity, references an object not yet held, or is a commit not signed by a key of its
+/// author's host. The store stays closed.
+pub(crate) fn accept_objects(
+    store: &mut Store,
+    host_keys: &dyn HostKeys,
+    objects: &[RawObject],
+) -> Result<u64> {
     let mut stored = 0;
     for object in objects {
         if ObjectId::compute(object.kind, &object.bytes) != object.id {
@@ -441,6 +466,7 @@ pub(crate) fn accept_objects(store: &mut Store, objects: &[RawObject]) -> Result
         if store.contains(&object.id) {
             continue;
         }
+        check_received(object.id, object.kind, &object.bytes, host_keys)?;
         for (child, kind) in references(object.id, object.kind, &object.bytes)? {
             match store.kind_of(&child) {
                 Some(found) if found == kind => {}

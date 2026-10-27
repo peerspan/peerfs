@@ -14,7 +14,7 @@ pub use hyper::Method;
 pub use wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest,
-    FetchRequest, ForkRequest, HaveRequest, HaveResponse, ImportRequest, MergeRequest,
+    FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest,
     MergeResponse, PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision,
     SpaceInfo, TrackingInfo, WorkspaceInfo,
 };

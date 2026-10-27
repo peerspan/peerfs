@@ -23,13 +23,13 @@ use axum::routing::{get, post};
 use peerfs_api::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest,
     CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
-    ExportRequest, FetchRequest, ForkRequest, HaveRequest, HaveResponse, ImportRequest,
+    ExportRequest, FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest,
     MergeRequest, MergeResponse, PullRequest, PullResponse, PushRequest, PushResponse,
     ReceiveResponse, Revision, SOCKET_NAME, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 use peerfs_core::{
     Author, Change, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH, MergeOutcome,
-    Merged, ObjectId, Space, Workspace, decode_objects, encode_objects,
+    Merged, ObjectId, PublicKey, Space, Workspace, decode_objects, encode_objects,
 };
 use serde::Deserialize;
 use tokio::net::UnixListener;
@@ -118,6 +118,7 @@ fn router_with(state: AppState) -> Router {
         .route("/v1/workspaces/{name}/merge", post(merge))
         .route("/v1/pull", post(pull))
         .route("/v1/remotes", get(remotes))
+        .route("/v1/hosts", get(hosts).post(add_host))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
@@ -280,7 +281,9 @@ impl From<Error> for ApiError {
             Error::InvalidName(_)
             | Error::InvalidPath(_)
             | Error::WrongEntry { .. }
-            | Error::Unsupported { .. } => (StatusCode::BAD_REQUEST, "invalid"),
+            | Error::Unsupported { .. }
+            | Error::InvalidHost(_) => (StatusCode::BAD_REQUEST, "invalid"),
+            Error::UnknownHostKey { .. } => (StatusCode::FORBIDDEN, "forbidden"),
             Error::Remote(_) | Error::RemoteObject { .. } => (StatusCode::BAD_GATEWAY, "remote"),
             _ => return Self::internal(&error),
         };
@@ -390,6 +393,7 @@ async fn space_info(State(state): State<AppState>) -> ApiResult<Json<SpaceInfo>>
             path: space.path().display().to_string(),
             host: host.to_owned(),
             objects: u64::try_from(space.object_count()).unwrap_or(u64::MAX),
+            key: space.public_key().map(|key| key.to_string()),
         }))
     })
     .await
@@ -459,6 +463,7 @@ async fn log(
                     u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
                 }),
                 message: commit.message,
+                signed_by: commit.signature.map(|signature| signature.key.to_string()),
             })
             .collect();
         Ok(Json(commits))
@@ -781,6 +786,43 @@ async fn pull(
         objects: pulled.objects,
         bytes: pulled.bytes,
     }))
+}
+
+async fn hosts(State(state): State<AppState>) -> ApiResult<Json<Vec<HostKey>>> {
+    with_space(&state, |space, _| {
+        Ok(Json(
+            space
+                .known_hosts()?
+                .into_iter()
+                .map(|(host, key)| HostKey {
+                    host,
+                    key: key.to_string(),
+                })
+                .collect(),
+        ))
+    })
+    .await
+}
+
+/// Adds a host key: `201 Created` when new, `200 OK` when it was already trusted.
+async fn add_host(
+    State(state): State<AppState>,
+    body: Result<Json<HostKey>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<HostKey>)> {
+    let Json(request) = body?;
+    let key: PublicKey = request
+        .key
+        .parse()
+        .map_err(|e: peerfs_core::ParseKeyError| ApiError::invalid(e.to_string()))?;
+    with_space(&state, move |space, _| {
+        let status = if space.add_known_host(&request.host, &key)? {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        Ok((status, Json(request)))
+    })
+    .await
 }
 
 async fn remotes(State(state): State<AppState>) -> ApiResult<Json<Vec<TrackingInfo>>> {

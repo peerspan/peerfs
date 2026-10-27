@@ -93,6 +93,15 @@ enum Command {
     },
     /// List branches pulled from other hosts, as of their last pull.
     Remotes,
+    /// Print the host and the key this space signs its commits with, as `<host> <key>`:
+    /// what another space gives `hosts add` to accept them.
+    Key,
+    /// List the keys trusted to sign other hosts' commits, or add one. Commits pulled or
+    /// pushed here must be signed by a key listed for the host they name.
+    Hosts {
+        #[command(subcommand)]
+        command: Option<HostsCommand>,
+    },
     /// Send a branch to another space and move its branch there. Refused if that branch
     /// moved since the last pull: pull, `ws merge`, and push again.
     Push {
@@ -123,6 +132,12 @@ enum Command {
     /// Work in a workspace.
     #[command(subcommand, name = "ws")]
     Workspace(WorkspaceCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum HostsCommand {
+    /// Trust `key`, in standard Base64, to sign commits naming `host` as their author.
+    Add { host: String, key: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -372,6 +387,21 @@ async fn client_command(
                 )?;
             }
         }
+        Command::Key => {
+            let space = client.space().await?;
+            let key = space.key.context("this space does not sign its commits")?;
+            writeln!(out, "{} {key}", space.host)?;
+        }
+        Command::Hosts { command: None } => {
+            for host in client.hosts().await? {
+                writeln!(out, "{} {}", host.host, host.key)?;
+            }
+        }
+        Command::Hosts {
+            command: Some(HostsCommand::Add { host, key }),
+        } => {
+            client.add_host(&host, &key).await?;
+        }
         Command::Fork { name, from } => {
             let branch = client.fork(&name, &from).await?;
             writeln!(out, "{} {}", branch.head, branch.name)?;
@@ -382,9 +412,14 @@ async fn client_command(
                     Some(agent) => format!("{agent}@{}", commit.host),
                     None => commit.host.clone(),
                 };
+                let unsigned = if commit.signed_by.is_none() {
+                    ", unsigned"
+                } else {
+                    ""
+                };
                 writeln!(
                     out,
-                    "{}\n  {who} at {}\n  {}",
+                    "{}\n  {who} at {}{unsigned}\n  {}",
                     commit.id,
                     commit.time_ms / 1000,
                     commit.message
