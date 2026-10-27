@@ -20,7 +20,9 @@ use crate::sign::{HostKeys, KeyFile, KnownHosts, PublicKey, Signer, sign_commit}
 use crate::store::{Store, sync_dir};
 use crate::sync::{Pull, Pulled, Push, RawObject, Remote, Tracking, TrackingRefs, accept_objects};
 use crate::workspace::Workspace;
-use std::collections::{HashSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 /// The first line of a space's `FORMAT` file.
 const FORMAT: &str = "peerfs space 2";
@@ -56,8 +58,13 @@ pub struct Space {
     tracking: TrackingRefs,
     signer: Option<Box<dyn Signer>>,
     host_keys: Box<dyn HostKeys>,
+    /// Decoded trees, which never change, so lookups do not decode them again.
+    trees: RefCell<HashMap<ObjectId, Arc<Tree>>>,
     _lock: File,
 }
+
+/// Decoded trees kept before the cache starts over.
+const CACHED_TREES: usize = 16_384;
 
 /// What committing a workspace did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +212,7 @@ impl Space {
             tracking: TrackingRefs::new(dir.join("refs/remotes")),
             signer,
             host_keys: Box::new(KnownHosts::new(dir.join(HOSTS_FILE))),
+            trees: RefCell::new(HashMap::new()),
             _lock: lock,
         })
     }
@@ -609,11 +617,27 @@ impl Space {
     ///
     /// Fails if the tree is missing, corrupt or not a tree.
     pub fn tree(&self, id: ObjectId) -> Result<Tree> {
-        Tree::decode(&self.object(id, Kind::Tree)?).map_err(|source| Error::Decode {
-            kind: Kind::Tree,
-            id,
-            source,
-        })
+        Ok(self.shared_tree(id)?.as_ref().clone())
+    }
+
+    /// Reads a directory listing through the cache of decoded trees.
+    pub(crate) fn shared_tree(&self, id: ObjectId) -> Result<Arc<Tree>> {
+        if let Some(tree) = self.trees.borrow().get(&id) {
+            return Ok(Arc::clone(tree));
+        }
+        let tree = Arc::new(
+            Tree::decode(&self.object(id, Kind::Tree)?).map_err(|source| Error::Decode {
+                kind: Kind::Tree,
+                id,
+                source,
+            })?,
+        );
+        let mut trees = self.trees.borrow_mut();
+        if trees.len() >= CACHED_TREES {
+            trees.clear();
+        }
+        trees.insert(id, Arc::clone(&tree));
+        Ok(tree)
     }
 
     /// Stores a commit, signed by the space's signer if it has one. Its tree and parents
@@ -742,7 +766,7 @@ impl Space {
             let Entry::Tree(id) = entry else {
                 return Ok(None);
             };
-            let Some(next) = self.tree(id)?.get(name).cloned() else {
+            let Some(next) = self.shared_tree(id)?.get(name).cloned() else {
                 return Ok(None);
             };
             entry = next;
@@ -1021,7 +1045,7 @@ impl Space {
         author: &Author,
     ) -> Result<Option<ObjectId>> {
         let base_tree = self.commit(workspace.base())?.tree;
-        let tree = workspace.apply(self, base_tree)?;
+        let tree = workspace.apply(self, base_tree)?.tree;
         let previous = workspace.snapshot();
         let previous_tree = match previous {
             Some(snapshot) => self.commit(snapshot)?.tree,
@@ -1087,7 +1111,8 @@ impl Space {
             .ok_or_else(|| Error::NoSuchBranch(branch.clone()))?;
         let base_commit = workspace.base();
         let base_tree = self.commit(base_commit)?.tree;
-        let ours = workspace.apply(self, base_tree)?;
+        let applied = workspace.apply(self, base_tree)?;
+        let ours = applied.tree;
         let merging = workspace.merging();
         if ours == base_tree && merging.is_none() {
             if head != base_commit {
@@ -1123,6 +1148,7 @@ impl Space {
             signature: None,
         })?;
         self.update_branch(&branch, Some(head), commit)?;
+        workspace.keep_mtimes(self, tree, &applied.files)?;
         workspace.finish_change(self, commit)?;
         Ok(CommitOutcome::Committed { commit, merged })
     }

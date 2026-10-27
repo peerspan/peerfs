@@ -4,16 +4,18 @@
 //! from its base in `whiteouts`. Reading looks at the overlay first, then the base commit.
 //! Every write is synced before it returns.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::classes::{Class, Classifier};
 use crate::error::{Error, Result};
 use crate::id::ObjectId;
-use crate::object::{ChangeId, Entry, FileMode, Name, Tree};
+use crate::object::{ChangeId, Content, Entry, FileMode, Name, Tree};
 use crate::path::TreePath;
 use crate::space::{Space, mode_of, permissions};
 use crate::store::sync_dir;
@@ -86,6 +88,99 @@ pub struct Workspace {
     snapshot: Option<ObjectId>,
     merging: Option<ObjectId>,
     whiteouts: BTreeSet<TreePath>,
+    /// The base commit's tree, once looked up.
+    base_tree: Cell<Option<ObjectId>>,
+    /// The state and whiteout files as this value last read or wrote them.
+    freshness: Freshness,
+    /// When each base entry was first seen at its path, loaded on first use.
+    stamps: Option<HashMap<TreePath, (u64, SystemTime)>>,
+}
+
+/// Identifies a version of a file: its inode, length and modification time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FileVersion {
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+}
+
+impl FileVersion {
+    fn of(path: &Path) -> Self {
+        fs::metadata(path).map_or_else(
+            |_| Self::default(),
+            |meta| Self {
+                inode: meta.ino(),
+                len: meta.len(),
+                modified: (meta.mtime(), meta.mtime_nsec()),
+            },
+        )
+    }
+}
+
+/// The versions of a workspace's state and whiteout files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Freshness {
+    state: FileVersion,
+    whiteouts: FileVersion,
+}
+
+impl Freshness {
+    fn of(dir: &Path) -> Self {
+        Self {
+            state: FileVersion::of(&dir.join(STATE)),
+            whiteouts: FileVersion::of(&dir.join(WHITEOUTS)),
+        }
+    }
+}
+
+const STATE: &str = "state";
+const WHITEOUTS: &str = "whiteouts";
+const STAMPS: &str = "stamps";
+
+/// A stable digest of a base entry, for telling whether a path's content changed.
+fn entry_key(entry: &Entry) -> u64 {
+    let mut hasher = blake3::Hasher::new_derive_key("peerfs 2026-10-27 stamp key");
+    match entry {
+        Entry::File { content, mode } => {
+            hasher.update(b"f");
+            hasher.update(&[match mode {
+                FileMode::Regular => 0,
+                FileMode::Executable => 1,
+            }]);
+            match content {
+                Content::Empty => {}
+                Content::Blob(id) | Content::Chunked(id) => {
+                    hasher.update(&id.to_bytes());
+                }
+            }
+        }
+        Entry::Symlink(target) => {
+            hasher.update(b"l");
+            hasher.update(target.as_bytes());
+        }
+        Entry::Tree(id) => {
+            hasher.update(b"d");
+            hasher.update(&id.to_bytes());
+        }
+    }
+    let mut key = [0; 8];
+    key.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(key)
+}
+
+/// One line of the stamp log.
+fn stamp_line(path: &TreePath, key: u64, at: SystemTime) -> String {
+    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    format!(
+        "{}.{:09} {key:016x} {path}\n",
+        since.as_secs(),
+        since.subsec_nanos()
+    )
+}
+
+fn parse_time(text: &str) -> Option<SystemTime> {
+    let (secs, nanos) = text.split_once('.')?;
+    Some(UNIX_EPOCH + Duration::new(secs.parse().ok()?, nanos.parse().ok()?))
 }
 
 fn upper(dir: &Path) -> PathBuf {
@@ -104,8 +199,13 @@ impl Workspace {
             snapshot: None,
             merging: None,
             whiteouts: BTreeSet::new(),
+            base_tree: Cell::new(None),
+            freshness: Freshness::default(),
+            stamps: None,
         };
+        let mut workspace = workspace;
         workspace.save()?;
+        workspace.save_whiteouts()?;
         if let Some(parent) = workspace.dir.parent() {
             sync_dir(parent)?;
         }
@@ -113,7 +213,8 @@ impl Workspace {
     }
 
     pub(crate) fn open(dir: PathBuf, name: Name) -> Result<Self> {
-        let state_path = dir.join("state");
+        let freshness = Freshness::of(&dir);
+        let state_path = dir.join(STATE);
         let state =
             fs::read_to_string(&state_path).map_err(|e| Error::io("reading", &state_path, e))?;
         let corrupt = |what: &str| Error::Corrupt(format!("workspace {name}: bad {what}"));
@@ -143,15 +244,23 @@ impl Workspace {
             Some(text) => Some(text.parse().map_err(|_| corrupt("merge"))?),
             None => None,
         };
-        let whiteouts_path = dir.join("whiteouts");
-        let whiteouts = match fs::read_to_string(&whiteouts_path) {
-            Ok(text) => text
-                .lines()
-                .map(TreePath::try_from)
-                .collect::<Result<BTreeSet<_>>>()?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+        let whiteouts_path = dir.join(WHITEOUTS);
+        let mut whiteouts = BTreeSet::new();
+        match fs::read_to_string(&whiteouts_path) {
+            // A log: `+path` adds a whiteout, `-path` drops one, a bare path adds one.
+            Ok(text) => {
+                for line in text.lines() {
+                    if let Some(dropped) = line.strip_prefix('-') {
+                        whiteouts.remove(&TreePath::try_from(dropped)?);
+                    } else {
+                        let added = line.strip_prefix('+').unwrap_or(line);
+                        whiteouts.insert(TreePath::try_from(added)?);
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(Error::io("reading", whiteouts_path, e)),
-        };
+        }
         Ok(Self {
             dir,
             name,
@@ -161,7 +270,112 @@ impl Workspace {
             snapshot,
             merging,
             whiteouts,
+            base_tree: Cell::new(None),
+            freshness,
+            stamps: None,
         })
+    }
+
+    /// Whether this value still matches the workspace on disk: no other value of it has
+    /// changed its state or removals since this one last read or wrote them. Files in the
+    /// overlay are always read from disk, so they never make a value stale.
+    pub fn is_current(&self) -> bool {
+        Freshness::of(&self.dir) == self.freshness
+    }
+
+    /// When the base entry `entry` at `path` is dated: when this workspace first saw that
+    /// content there, or when a commit took it from the overlay with that mtime. Kept in
+    /// the workspace, so the date survives commits and remounts and changes only with the
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the workspace's stamps cannot be read or written.
+    pub fn stamp(&mut self, path: &TreePath, entry: &Entry) -> Result<SystemTime> {
+        let key = entry_key(entry);
+        if let Some((known, at)) = self.stamps()?.get(path)
+            && *known == key
+        {
+            return Ok(*at);
+        }
+        let now = SystemTime::now();
+        self.record_stamp(path, key, now)?;
+        Ok(now)
+    }
+
+    /// Dates the base entry `entry` at `path` to `at`.
+    pub(crate) fn set_stamp(
+        &mut self,
+        path: &TreePath,
+        entry: &Entry,
+        at: SystemTime,
+    ) -> Result<()> {
+        self.stamps()?;
+        self.record_stamp(path, entry_key(entry), at)
+    }
+
+    fn stamps(&mut self) -> Result<&mut HashMap<TreePath, (u64, SystemTime)>> {
+        if self.stamps.is_none() {
+            self.stamps = Some(self.load_stamps()?);
+        }
+        Ok(self.stamps.get_or_insert_with(HashMap::new))
+    }
+
+    /// Reads the stamp log, `seconds.nanoseconds key path` per line, the last line for a
+    /// path winning; rewrites it when it has grown well past the stamps it holds.
+    fn load_stamps(&self) -> Result<HashMap<TreePath, (u64, SystemTime)>> {
+        let path = self.dir.join(STAMPS);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => return Err(Error::io("reading", &path, e)),
+        };
+        let mut stamps = HashMap::new();
+        let mut lines = 0_usize;
+        for line in text.lines() {
+            lines += 1;
+            let mut fields = line.splitn(3, ' ');
+            let (Some(at), Some(key), Some(at_path)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let (Some(at), Ok(key), Ok(at_path)) = (
+                parse_time(at),
+                u64::from_str_radix(key, 16),
+                TreePath::try_from(at_path),
+            ) else {
+                continue;
+            };
+            stamps.insert(at_path, (key, at));
+        }
+        if lines > 2 * stamps.len() + 1024 {
+            let mut compact = String::new();
+            for (at_path, (key, at)) in &stamps {
+                compact.push_str(&stamp_line(at_path, *key, *at));
+            }
+            write_synced(&self.dir, STAMPS, compact.as_bytes())?;
+        }
+        Ok(stamps)
+    }
+
+    fn record_stamp(&mut self, path: &TreePath, key: u64, at: SystemTime) -> Result<()> {
+        let text = path.to_string();
+        // A name holding a line break cannot be logged; it is dated afresh each time.
+        if !text.contains(['\n', '\r']) {
+            let log = self.dir.join(STAMPS);
+            // Not synced: a lost stamp only dates a file afresh, which costs a rebuild.
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .and_then(|mut file| file.write_all(stamp_line(path, key, at).as_bytes()))
+                .map_err(|e| Error::io("writing", &log, e))?;
+        }
+        if let Some(stamps) = &mut self.stamps {
+            stamps.insert(path.clone(), (key, at));
+        }
+        Ok(())
     }
 
     /// The workspace's name.
@@ -225,7 +439,8 @@ impl Workspace {
         full
     }
 
-    fn save(&self) -> Result<()> {
+    /// Writes the state file.
+    fn save(&mut self) -> Result<()> {
         let snapshot = self
             .snapshot
             .map(|snapshot| format!("snapshot {snapshot}\n"))
@@ -238,28 +453,74 @@ impl Workspace {
             "branch {}\nbase {}\nchange {}\n{snapshot}{merge}",
             self.branch, self.base, self.change
         );
-        write_synced(&self.dir, "state", state.as_bytes())?;
+        write_synced(&self.dir, STATE, state.as_bytes())?;
+        self.freshness = Freshness::of(&self.dir);
+        Ok(())
+    }
+
+    /// Rewrites the whiteout log as the current set.
+    fn save_whiteouts(&mut self) -> Result<()> {
         let mut whiteouts = String::new();
         for path in &self.whiteouts {
             whiteouts.push_str(&path.to_string());
             whiteouts.push('\n');
         }
-        write_synced(&self.dir, "whiteouts", whiteouts.as_bytes())
+        write_synced(&self.dir, WHITEOUTS, whiteouts.as_bytes())?;
+        self.freshness = Freshness::of(&self.dir);
+        Ok(())
+    }
+
+    /// Records the removal of the base's entry at `path`, durably.
+    fn add_whiteout(&mut self, path: &TreePath) -> Result<()> {
+        if self.whiteouts.insert(path.clone()) {
+            self.log_whiteout('+', path)?;
+        }
+        Ok(())
+    }
+
+    /// Forgets a removal at `path`, durably.
+    fn drop_whiteout(&mut self, path: &TreePath) -> Result<()> {
+        if self.whiteouts.remove(path) {
+            self.log_whiteout('-', path)?;
+        }
+        Ok(())
+    }
+
+    fn log_whiteout(&mut self, op: char, path: &TreePath) -> Result<()> {
+        let log = self.dir.join(WHITEOUTS);
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .and_then(|mut file| {
+                file.write_all(format!("{op}{path}\n").as_bytes())?;
+                file.sync_data()
+            })
+            .map_err(|e| Error::io("writing", &log, e))?;
+        self.freshness = Freshness::of(&self.dir);
+        Ok(())
     }
 
     fn base_tree(&self, space: &Space) -> Result<ObjectId> {
-        Ok(space.commit(self.base)?.tree)
+        if let Some(tree) = self.base_tree.get() {
+            return Ok(tree);
+        }
+        let tree = space.commit(self.base)?.tree;
+        self.base_tree.set(Some(tree));
+        Ok(tree)
     }
 
     /// Whether the base's entry at `path` is hidden by a removal or by a file written over
     /// one of its directories.
     fn hidden(&self, path: &TreePath) -> bool {
-        if self
-            .whiteouts
-            .iter()
-            .any(|removed| path.starts_with(removed))
-        {
-            return true;
+        if !self.whiteouts.is_empty() {
+            let mut prefix = TreePath::root();
+            for name in path.components() {
+                prefix = prefix.join(name);
+                if self.whiteouts.contains(&prefix) {
+                    return true;
+                }
+            }
         }
         let mut ancestor = path.clone();
         while let Some((parent, _)) = ancestor.split_last() {
@@ -342,9 +603,7 @@ impl Workspace {
             .and_then(|()| file.sync_data())
             .map_err(|e| Error::io("writing", &local, e))?;
         sync_dir(&parent)?;
-        if self.whiteouts.remove(&tree_path) {
-            self.save()?;
-        }
+        self.drop_whiteout(&tree_path)?;
         Ok(())
     }
 
@@ -521,8 +780,7 @@ impl Workspace {
         let local_to = self.upper_path(to);
         fs::rename(&local_from, &local_to).map_err(|e| Error::io("renaming", &local_from, e))?;
         if from_in_base {
-            self.whiteouts.insert(from.clone());
-            self.save()?;
+            self.add_whiteout(from)?;
         }
         Ok(())
     }
@@ -539,8 +797,7 @@ impl Workspace {
         };
         let in_base = self.base_entry(space, &tree_path)?.is_some();
         if in_base {
-            self.whiteouts.insert(tree_path.clone());
-            self.save()?;
+            self.add_whiteout(&tree_path)?;
         }
         if !in_upper && !in_base {
             return Err(Error::NotFound(tree_path.to_string()));
@@ -560,7 +817,7 @@ impl Workspace {
         match self.base_entry(space, &tree_path)? {
             Some(Entry::Tree(id)) => {
                 found = true;
-                for (name, entry) in space.tree(id)?.iter() {
+                for (name, entry) in space.shared_tree(id)?.iter() {
                     if !self.whiteouts.contains(&tree_path.join(name)) {
                         entries.insert(name.to_string(), EntryKind::of(entry));
                     }
@@ -658,8 +915,9 @@ impl Workspace {
 
     /// Applies the overlay's source entries and removals to `base_tree` and returns the
     /// resulting tree.
-    pub(crate) fn apply(&self, space: &mut Space, base_tree: ObjectId) -> Result<ObjectId> {
+    pub(crate) fn apply(&self, space: &mut Space, base_tree: ObjectId) -> Result<Applied> {
         let written = self.classified(space)?.source;
+        let mut files = Vec::new();
         let mut edit = space.edit(base_tree)?;
         for removed in &self.whiteouts {
             edit.remove(space, removed)?;
@@ -683,9 +941,31 @@ impl Workspace {
                     mode: mode_of(meta.permissions().mode()),
                 }
             };
+            if let Ok(modified) = meta.modified() {
+                files.push((path.clone(), entry.clone(), modified));
+            }
             edit.insert(space, &path, entry)?;
         }
-        edit.finish(space)
+        Ok(Applied {
+            tree: edit.finish(space)?,
+            files,
+        })
+    }
+
+    /// Dates each entry committed from the overlay that `tree` holds unchanged to the
+    /// overlay file's mtime, so committing it does not make it look modified.
+    pub(crate) fn keep_mtimes(
+        &mut self,
+        space: &Space,
+        tree: ObjectId,
+        files: &[(TreePath, Entry, SystemTime)],
+    ) -> Result<()> {
+        for (path, entry, modified) in files {
+            if space.entry(tree, path)?.as_ref() == Some(entry) {
+                self.set_stamp(path, entry, *modified)?;
+            }
+        }
+        Ok(())
     }
 
     /// Drops the overlay's source entries and removals, keeps its derived and secret
@@ -694,6 +974,8 @@ impl Workspace {
         let kept = self.kept_local(space)?;
         prune_upper(&upper(&self.dir), &TreePath::root(), &kept)?;
         self.whiteouts.clear();
+        self.save_whiteouts()?;
+        self.base_tree.set(None);
         self.merging = None;
         self.base = commit;
         self.save()
@@ -714,7 +996,8 @@ impl Workspace {
             Some(&Entry::Tree(head_tree)),
             Some(&Entry::Tree(target)),
         )?;
-        self.save()
+        self.save()?;
+        self.save_whiteouts()
     }
 
     fn materialize(
@@ -803,6 +1086,14 @@ fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let target = dir.join(name);
     fs::rename(&temporary, &target).map_err(|e| Error::io("renaming", &temporary, e))?;
     sync_dir(dir)
+}
+
+/// A tree made from a workspace's overlay, with what each overlay entry became and the
+/// overlay file's mtime.
+#[derive(Debug)]
+pub(crate) struct Applied {
+    pub(crate) tree: ObjectId,
+    pub(crate) files: Vec<(TreePath, Entry, SystemTime)>,
 }
 
 /// An overlay's entries by class.

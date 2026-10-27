@@ -12,9 +12,12 @@
 //! - Removing a base entry records a whiteout. Renaming a directory that holds base
 //!   content fails with `EXDEV`, as on kernel overlay file systems, so `mv` copies instead.
 //! - Inode numbers are given per path and follow renames.
-//! - A base file's modification time is when this mount first saw its content at that
-//!   path. An overlay file's own mtime is not carried over when it is committed, and a new
-//!   mount starts afresh, so both make builds redo work once.
+//! - A base file's modification time is the workspace's stamp for its content at that
+//!   path: the overlay file's mtime when a commit took it, or when the workspace first saw
+//!   that content. Stamps persist, so neither a commit nor a new mount makes unchanged
+//!   files look modified.
+//! - The mount keeps one view of the workspace and reloads it only when the local API
+//!   has changed its state or removals.
 //!
 //! Not supported: hard links, special files, extended attributes, and file locks beyond
 //! what the kernel does itself.
@@ -146,8 +149,8 @@ impl Cache {
 #[derive(Debug)]
 struct State {
     inodes: Inodes,
-    /// When each base entry was first seen at its path.
-    seen: HashMap<TreePath, (Entry, SystemTime)>,
+    /// The workspace as last read, reused while it is current.
+    workspace: Option<Workspace>,
     cache: Cache,
 }
 
@@ -174,7 +177,7 @@ impl WorkspaceFs {
             workspace: workspace.to_owned(),
             state: Mutex::new(State {
                 inodes: Inodes::new(),
-                seen: HashMap::new(),
+                workspace: None,
                 cache: Cache::default(),
             }),
             uid,
@@ -188,15 +191,20 @@ impl WorkspaceFs {
         work: impl FnOnce(&mut Space, &mut Workspace, &mut State) -> io::Result<T>,
     ) -> io::Result<T> {
         let mut space = lock(&self.space);
-        let mut workspace = space.workspace(&self.workspace).map_err(to_errno)?;
         let mut state = lock(&self.state);
-        work(&mut space, &mut workspace, &mut state)
+        let mut workspace = match state.workspace.take() {
+            Some(workspace) if workspace.is_current() => workspace,
+            _ => space.workspace(&self.workspace).map_err(to_errno)?,
+        };
+        let done = work(&mut space, &mut workspace, &mut state);
+        state.workspace = Some(workspace);
+        done
     }
 
     fn attr(
         &self,
         space: &Space,
-        workspace: &Workspace,
+        workspace: &mut Workspace,
         state: &mut State,
         path: &TreePath,
     ) -> io::Result<stat64> {
@@ -234,15 +242,8 @@ impl WorkspaceFs {
                     Entry::Symlink(target) => (libc::S_IFLNK | 0o777, len_u64(target.len())),
                     Entry::Tree(_) => (libc::S_IFDIR | 0o755, 4096),
                 };
-                let seen = match state.seen.get(path) {
-                    Some((known, at)) if *known == entry => *at,
-                    _ => {
-                        let now = SystemTime::now();
-                        state.seen.insert(path.clone(), (entry, now));
-                        now
-                    }
-                };
-                let since = seen.duration_since(UNIX_EPOCH).unwrap_or_default();
+                let stamped = workspace.stamp(path, &entry).map_err(to_errno)?;
+                let since = stamped.duration_since(UNIX_EPOCH).unwrap_or_default();
                 st.st_mode = mode;
                 st.st_size = to_i64(size);
                 st.st_mtime = to_i64(since.as_secs());
@@ -265,7 +266,7 @@ impl WorkspaceFs {
     fn entry(
         &self,
         space: &Space,
-        workspace: &Workspace,
+        workspace: &mut Workspace,
         state: &mut State,
         path: &TreePath,
     ) -> io::Result<FuseEntry> {
