@@ -9,7 +9,7 @@ selectively is the broader one.
 
 The design and its agreed decisions are in `peerspan/docs-internal`, `docs/peerfs.md`.
 
-## Status: milestone 1, the local core
+## Status: milestones 1 and 2, the local core and its server
 
 What works today, on one host:
 
@@ -22,13 +22,36 @@ What works today, on one host:
 | Branches | Move only by compare-and-swap, written by sync and rename; forking copies nothing | — |
 | Workspaces | A writable overlay over a commit; every write synced before it returns | 3, 4 |
 | Commit | Fast path when the branch has not moved; otherwise a three-way merge onto the new head. Text up to 1 MiB merges by line; a conflict commits nothing and leaves markers in the workspace to resolve | 2 |
-| CLI | `peerfs init`, `import`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / discard` | 4 |
+| Server | `peerfs serve` owns the space and serves it at `<space>/peerfs.sock`, so concurrent agents serialize through it; it exits after an idle timeout and on SIGTERM | 4 |
+| API | HTTP/1.1 and JSON over the Unix socket, following the host daemon's `admin.sock` conventions; a Rust client in `peerfs-api` | 4, 9 |
+| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `import`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / discard` | 4 |
 
 Not yet: signing, replication between hosts and durability receipts, owner rules for
 conflicts (`regenerate`, `ours`/`theirs`, structured merge), source/derived/secret path
 classes, garbage collection, branch handoff, the local contract with the Peerspan host
-daemon, and the FUSE, NFS and VM frontends. Files are read and written whole in memory.
-A space is held by one process at a time. Linux and macOS only.
+daemon, and the FUSE, NFS and VM frontends. Files are read and written whole in memory,
+and the server applies requests one at a time. Linux and macOS only.
+
+## The local API
+
+`peerfs serve` listens on `<space>/peerfs.sock` (mode 0600) and writes `<space>/serve.pid`.
+Requests and responses are JSON under `/v1`; errors are `{"code", "error"}` with `invalid`
+(400), `not_found` (404), `conflict` (409) or `internal` (500); unknown fields are rejected.
+File contents are raw bodies. Commits record the server's host and the agent and session
+the request names.
+
+| Route | Does |
+| --- | --- |
+| `GET /v1/space` | The space's path, host and object count |
+| `GET, POST /v1/branches` | List branches; fork one (`{name, from}`) |
+| `GET /v1/branches/{name}/log?limit=N` | History, newest first |
+| `POST /v1/import`, `POST /v1/export` | Commit a directory onto a branch; write a revision to a directory (absolute paths on the server's host) |
+| `GET, POST /v1/workspaces` | List workspaces; create one (`{name, branch}`) |
+| `GET, DELETE /v1/workspaces/{name}` | Describe or discard a workspace |
+| `GET, PUT, DELETE /v1/workspaces/{name}/files/{path}` | Read, write or remove a file |
+| `GET /v1/workspaces/{name}/list?path=dir` | List a directory |
+| `GET /v1/workspaces/{name}/changes` | Uncommitted changes |
+| `POST /v1/workspaces/{name}/commit` | Commit (`{message, caller}`); the outcome is `committed`, `conflicted` or `unchanged` |
 
 ## Try it
 
@@ -50,10 +73,13 @@ peerfs ws read agent-2 notes.txt
 | Path | Contents |
 | --- | --- |
 | `crates/peerfs-core` | The library: objects, store, branches, workspaces, merge |
-| `crates/peerfs` | The command-line interface |
+| `crates/peerfs-api` | The local API's JSON bodies and a client over its socket |
+| `crates/peerfs-server` | The server: one space behind the API |
+| `crates/peerfs` | The command-line interface, a client of the server |
 
 A space on disk is `FORMAT`, `objects/pack-*.pack`, `refs/branches/<name>`, and
-`workspaces/<name>/` (`state`, `whiteouts`, `upper/`).
+`workspaces/<name>/` (`state`, `whiteouts`, `upper/`), and while a server runs,
+`peerfs.sock`, `serve.pid` and its log `serve.log`.
 
 ## Checks
 

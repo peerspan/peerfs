@@ -9,7 +9,13 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+peerfs-api.workspace = true
 peerfs-core.workspace = true
+peerfs-server.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

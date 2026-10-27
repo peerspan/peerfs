@@ -1,0 +1,20 @@
+[package]
+name = "peerfs-server"
+description = "The peerfs local API server: one space, served over a Unix socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+peerfs-api.workspace = true
+peerfs-core.workspace = true
+serde.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
