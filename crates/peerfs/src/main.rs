@@ -1,7 +1,10 @@
 //! `peerfs`: create spaces, serve them, and work in workspaces from the command line.
 //!
-//! Every command except `init` and `serve` is a client of the space's server. When none is
-//! running, the command starts one in the background, which exits after ten idle minutes.
+//! Every command except `init`, `serve` and `stop` is a client of the space's server. When
+//! none is running, the command starts one in the background, which exits after ten idle
+//! minutes or on `peerfs stop`.
+
+mod stop;
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -52,6 +55,8 @@ enum Command {
         #[arg(long)]
         idle_timeout: Option<u64>,
     },
+    /// Stop the space's server, if one is running. Never starts one.
+    Stop,
     /// Commit a directory's contents onto a branch.
     Import {
         /// The directory to import.
@@ -194,6 +199,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .with_context(|| format!("serving {}", space_dir.display()))?;
             Ok(ExitCode::SUCCESS)
         }
+        Command::Stop => stop::stop(&space_dir, &mut io::stdout().lock()).await,
         command => {
             let client = connect(&space_dir, cli.host.as_deref()).await?;
             let caller = Caller {
@@ -281,7 +287,9 @@ async fn client_command(
     out: &mut impl Write,
 ) -> Result<ExitCode> {
     match command {
-        Command::Init | Command::Serve { .. } => unreachable!("handled without a client"),
+        Command::Init | Command::Serve { .. } | Command::Stop => {
+            unreachable!("handled without a client")
+        }
         Command::Import {
             source,
             branch,

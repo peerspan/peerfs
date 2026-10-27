@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_peerfs");
 
@@ -136,4 +137,93 @@ fn a_conflict_exits_with_status_one() {
     let conflicted = peerfs(&space.path, "b", &["ws", "commit", "b", "-m", "b"], None);
     assert_eq!(conflicted.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&conflicted.stdout).contains("conflict: f.txt"));
+}
+
+#[test]
+fn stop_stops_an_autostarted_server_and_the_next_command_starts_another() {
+    let space = new_space();
+    ok(&peerfs(&space.path, "a", &["branches"], None));
+    let socket = space.path.join("peerfs.sock");
+    let pid_file = space.path.join("serve.pid");
+    let pid = std::fs::read_to_string(&pid_file).expect("the server wrote its pid");
+    let pid = pid.trim().to_owned();
+    assert!(socket.exists());
+
+    let stopped = ok(&peerfs(&space.path, "a", &["stop"], None));
+    assert!(
+        stopped.contains(&format!("stopped the server (process {pid})")),
+        "{stopped}"
+    );
+    assert!(!socket.exists());
+    assert!(!pid_file.exists());
+    let started = Instant::now();
+    while alive(&pid) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "process {pid} outlived its socket"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    ok(&peerfs(&space.path, "a", &["branches"], None));
+    assert!(socket.exists());
+    let again = std::fs::read_to_string(&pid_file).expect("a new server wrote its pid");
+    assert_ne!(again.trim(), pid);
+    ok(&peerfs(&space.path, "a", &["stop"], None));
+    assert!(!socket.exists());
+    assert!(!pid_file.exists());
+}
+
+#[test]
+fn stop_without_a_server_says_so_and_starts_none() {
+    let space = new_space();
+    let out = ok(&peerfs(&space.path, "a", &["stop"], None));
+    assert!(out.contains("no server is running"), "{out}");
+    assert!(!space.path.join("peerfs.sock").exists());
+    assert!(!space.path.join("serve.pid").exists());
+}
+
+#[test]
+fn stop_removes_a_pid_file_naming_a_dead_process() {
+    let space = new_space();
+    let mut child = Command::new("true").spawn().expect("true starts");
+    let pid = child.id();
+    child.wait().expect("true exits");
+    let pid_file = space.path.join("serve.pid");
+    std::fs::write(&pid_file, format!("{pid}\n")).expect("write pid file");
+
+    let out = ok(&peerfs(&space.path, "a", &["stop"], None));
+    assert!(out.contains("stale"), "{out}");
+    assert!(out.contains(&format!("process {pid} is gone")), "{out}");
+    assert!(!pid_file.exists());
+    assert!(!space.path.join("peerfs.sock").exists());
+}
+
+#[test]
+fn stop_does_not_signal_an_unrelated_process() {
+    let space = new_space();
+    let mut sleeper = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("sleep starts");
+    let pid_file = space.path.join("serve.pid");
+    std::fs::write(&pid_file, format!("{}\n", sleeper.id())).expect("write pid file");
+
+    let out = peerfs(&space.path, "a", &["stop"], None);
+    let still_running = sleeper.try_wait().expect("poll sleep").is_none();
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    let out = ok(&out);
+    assert!(still_running, "sleep was signalled");
+    assert!(out.contains("was not signalled"), "{out}");
+    assert!(!pid_file.exists());
+}
+
+/// Whether `pid` is a live process this user can signal.
+fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }

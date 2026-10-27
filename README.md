@@ -22,9 +22,9 @@ What works today, on one host:
 | Branches | Move only by compare-and-swap, written by sync and rename; forking copies nothing | — |
 | Workspaces | A writable overlay over a commit; every write synced before it returns | 3, 4 |
 | Commit | Fast path when the branch has not moved; otherwise a three-way merge onto the new head. Text up to 1 MiB merges by line; a conflict commits nothing and leaves markers in the workspace to resolve | 2 |
-| Server | `peerfs serve` owns the space and serves it at `<space>/peerfs.sock`, so concurrent agents serialize through it; it exits after an idle timeout and on SIGTERM | 4 |
+| Server | `peerfs serve` owns the space and serves it at `<space>/peerfs.sock`, so concurrent agents serialize through it; it exits after an idle timeout, on SIGTERM and on `peerfs stop` | 4 |
 | API | HTTP/1.1 and JSON over the Unix socket, following the host daemon's `admin.sock` conventions; a Rust client in `peerfs-api` | 4, 9 |
-| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `import`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / discard` | 4 |
+| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / discard` | 4 |
 
 Not yet: signing, replication between hosts and durability receipts, owner rules for
 conflicts (`regenerate`, `ours`/`theirs`, structured merge), source/derived/secret path
