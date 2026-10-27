@@ -1,7 +1,8 @@
 //! Workspaces: reading, writing, committing, and merging parallel work.
 
 use peerfs_core::{
-    Author, Change, CommitOutcome, ConflictKind, EntryKind, Error, Merged, Space, TreePath,
+    Author, Change, CommitOutcome, ConflictKind, EntryKind, Error, Merged, NewEntry, Space,
+    TreePath,
 };
 
 fn author(agent: &str) -> Author {
@@ -90,6 +91,56 @@ fn a_removed_directory_can_be_written_into_again() {
         check.list(&space, "d").unwrap(),
         vec![("new.txt".to_owned(), EntryKind::File)]
     );
+}
+
+#[test]
+fn a_file_replaced_by_rename_create_or_link_is_written_not_removed() {
+    // Editors and agents save by renaming a new file over the old, or by removing it and
+    // creating it again; either is a change to the file.
+    let (_dir, mut space) = space_with(&[
+        ("renamed.txt", "old\n"),
+        ("recreated.txt", "old\n"),
+        ("linked.txt", "old\n"),
+        ("d/inner.txt", "inner\n"),
+    ]);
+    let mut ws = space.create_workspace("w", "main").unwrap();
+    let path = |text: &str| TreePath::try_from(text).unwrap();
+    let file = NewEntry::File { executable: false };
+
+    ws.write(&space, ".renamed.txt.tmp", b"new\n").unwrap();
+    ws.rename(&space, &path(".renamed.txt.tmp"), &path("renamed.txt"))
+        .unwrap();
+    ws.remove(&space, "recreated.txt").unwrap();
+    ws.create_entry(&space, &path("recreated.txt"), file)
+        .unwrap();
+    ws.write(&space, "recreated.txt", b"new\n").unwrap();
+    ws.remove(&space, "linked.txt").unwrap();
+    ws.link(&space, &path("renamed.txt"), &path("linked.txt"))
+        .unwrap();
+    // A file in place of a directory still removes what the directory held.
+    ws.remove(&space, "d").unwrap();
+    ws.create_entry(&space, &path("d"), file).unwrap();
+
+    assert_eq!(
+        ws.changes(&space).unwrap(),
+        vec![
+            Change::Added(path("d")),
+            Change::Written(path("linked.txt")),
+            Change::Written(path("recreated.txt")),
+            Change::Written(path("renamed.txt")),
+            Change::Removed(path("d")),
+        ]
+    );
+    committed(
+        space
+            .commit_workspace(&mut ws, "save", &author("a"))
+            .unwrap(),
+    );
+    let check = space.create_workspace("check", "main").unwrap();
+    for name in ["renamed.txt", "recreated.txt", "linked.txt"] {
+        assert_eq!(check.read(&space, name).unwrap(), b"new\n", "{name}");
+    }
+    assert_eq!(check.read(&space, "d").unwrap(), b"");
 }
 
 #[test]

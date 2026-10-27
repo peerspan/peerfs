@@ -514,6 +514,21 @@ impl Workspace {
         Ok(())
     }
 
+    /// Forgets the removal at `path` now that a file or link is there again, when what it
+    /// removed was a file or link too: the path was changed, not removed and added. A
+    /// removed directory stays removed, so its entries stay hidden.
+    fn replaced(&mut self, space: &Space, path: &TreePath) -> Result<()> {
+        if !self.whiteouts.remove(path) {
+            return Ok(());
+        }
+        let base = self.base_entry(space, path);
+        self.whiteouts.insert(path.clone());
+        if matches!(base?, Some(Entry::File { .. } | Entry::Symlink(_))) {
+            self.drop_whiteout(path)?;
+        }
+        Ok(())
+    }
+
     fn log_whiteout(&mut self, op: char, path: &TreePath) -> Result<()> {
         let log = self.dir.join(WHITEOUTS);
         fs::OpenOptions::new()
@@ -739,6 +754,9 @@ impl Workspace {
             NewEntry::Symlink(target) => symlink(target, &local),
         };
         created.map_err(|e| Error::io("creating", &local, e))?;
+        if !matches!(new, NewEntry::Directory) {
+            self.replaced(space, path)?;
+        }
         Ok(local)
     }
 
@@ -785,6 +803,7 @@ impl Workspace {
         let local_to = self.upper_path(to);
         self.changed_overlay();
         fs::hard_link(&local_from, &local_to).map_err(|e| Error::io("linking", &local_to, e))?;
+        self.replaced(space, to)?;
         Ok(local_to)
     }
 
@@ -859,6 +878,9 @@ impl Workspace {
         fs::rename(&local_from, &local_to).map_err(|e| Error::io("renaming", &local_from, e))?;
         if from_in_base {
             self.add_whiteout(from)?;
+        }
+        if !source_is_dir {
+            self.replaced(space, to)?;
         }
         Ok(())
     }
