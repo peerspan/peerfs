@@ -19,8 +19,12 @@
 //! - The mount keeps one view of the workspace and reloads it only when the local API
 //!   has changed its state or removals.
 //!
-//! Not supported: hard links, special files, extended attributes, and file locks beyond
-//! what the kernel does itself.
+//! - A hard link shares one overlay file and one inode number between its paths, copying
+//!   a base file up first. A commit takes each path's content, so afterwards they are
+//!   separate files.
+//!
+//! Not supported: hard links to directories, special files, extended attributes, and file
+//! locks beyond what the kernel does itself.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
@@ -57,10 +61,11 @@ const THREADS: usize = 2;
 /// The root's inode number, fixed by FUSE.
 const ROOT: u64 = 1;
 
-/// Inode numbers by path, and back.
+/// Inode numbers by path, and back. The paths of a hard link share a number; requests on
+/// it use the first.
 #[derive(Debug, Default)]
 struct Inodes {
-    paths: HashMap<u64, TreePath>,
+    paths: HashMap<u64, Vec<TreePath>>,
     numbers: HashMap<TreePath, u64>,
     next: u64,
 }
@@ -71,7 +76,7 @@ impl Inodes {
             next: ROOT + 1,
             ..Self::default()
         };
-        inodes.paths.insert(ROOT, TreePath::root());
+        inodes.paths.insert(ROOT, vec![TreePath::root()]);
         inodes.numbers.insert(TreePath::root(), ROOT);
         inodes
     }
@@ -79,6 +84,7 @@ impl Inodes {
     fn path(&self, inode: u64) -> io::Result<TreePath> {
         self.paths
             .get(&inode)
+            .and_then(|paths| paths.first())
             .cloned()
             .ok_or_else(|| errno(libc::ENOENT))
     }
@@ -89,9 +95,68 @@ impl Inodes {
         }
         let number = self.next;
         self.next += 1;
-        self.paths.insert(number, path.clone());
+        self.paths.insert(number, vec![path.clone()]);
         self.numbers.insert(path.clone(), number);
         number
+    }
+
+    /// Gives `to` the number of `from`, forgetting any it had.
+    fn link(&mut self, from: &TreePath, to: &TreePath) -> u64 {
+        let number = self.number(from);
+        self.forget(to);
+        self.paths.entry(number).or_default().push(to.clone());
+        self.numbers.insert(to.clone(), number);
+        number
+    }
+
+    /// Forgets `path` if it is one of a link's paths. A removed file's sole path keeps its
+    /// number, as before.
+    fn unlink(&mut self, path: &TreePath) {
+        let linked = self
+            .numbers
+            .get(path)
+            .and_then(|number| self.paths.get(number))
+            .is_some_and(|paths| paths.len() > 1);
+        if linked {
+            self.forget(path);
+        }
+    }
+
+    fn forget(&mut self, path: &TreePath) {
+        let Some(number) = self.numbers.remove(path) else {
+            return;
+        };
+        if let Some(paths) = self.paths.get_mut(&number) {
+            paths.retain(|other| other != path);
+            if paths.is_empty() {
+                self.paths.remove(&number);
+            }
+        }
+    }
+
+    /// Gives each path that no longer shares its link's file, as `file` identifies them, a
+    /// number of its own on its next lookup.
+    fn split_links(&mut self, mut file: impl FnMut(&TreePath) -> Option<(u64, u64)>) {
+        let linked: Vec<Vec<TreePath>> = self
+            .paths
+            .values()
+            .filter(|paths| paths.len() > 1)
+            .cloned()
+            .collect();
+        for paths in linked {
+            let files: Vec<_> = paths.iter().map(&mut file).collect();
+            // Keep the paths that share the first overlay file found; with none, the first.
+            let kept = files.iter().find_map(|file| *file);
+            for (index, (path, file)) in paths.iter().zip(files).enumerate() {
+                let keep = match kept {
+                    Some(kept) => file == Some(kept),
+                    None => index == 0,
+                };
+                if !keep {
+                    self.forget(path);
+                }
+            }
+        }
     }
 
     /// Moves `from` and everything under it to `to`; whatever was at `to` is forgotten.
@@ -102,9 +167,8 @@ impl Inodes {
             .filter(|(path, _)| path.starts_with(from) || path.starts_with(to))
             .map(|(path, number)| (path.clone(), *number))
             .collect();
-        for (path, number) in &moved {
-            self.numbers.remove(path);
-            self.paths.remove(number);
+        for (path, _) in &moved {
+            self.forget(path);
         }
         for (path, number) in moved {
             if !path.starts_with(from) {
@@ -114,7 +178,7 @@ impl Inodes {
             for name in &path.components()[from.components().len()..] {
                 renamed = renamed.join(name);
             }
-            self.paths.insert(number, renamed.clone());
+            self.paths.entry(number).or_default().push(renamed.clone());
             self.numbers.insert(renamed, number);
         }
     }
@@ -194,7 +258,20 @@ impl WorkspaceFs {
         let mut state = lock(&self.state);
         let mut workspace = match state.workspace.take() {
             Some(workspace) if workspace.is_current() => workspace,
-            _ => space.workspace(&self.workspace).map_err(to_errno)?,
+            _ => {
+                let workspace = space.workspace(&self.workspace).map_err(to_errno)?;
+                // A commit or the local API may have turned a link's paths into separate
+                // files.
+                state
+                    .inodes
+                    .split_links(|path| match workspace.locate(&space, path) {
+                        Ok(Some(Located::Local(local))) => fs::symlink_metadata(local)
+                            .ok()
+                            .map(|meta| (meta.dev(), meta.ino())),
+                        _ => None,
+                    });
+                workspace
+            }
         };
         let done = work(&mut space, &mut workspace, &mut state);
         state.workspace = Some(workspace);
@@ -223,6 +300,7 @@ impl WorkspaceFs {
             Located::Local(local) => {
                 let meta = fs::symlink_metadata(&local)?;
                 st.st_mode = meta.mode();
+                st.st_nlink = meta.nlink();
                 st.st_size = to_i64(meta.size());
                 st.st_mtime = meta.mtime();
                 st.st_mtime_nsec = meta.mtime_nsec();
@@ -250,11 +328,11 @@ impl WorkspaceFs {
                 st.st_mtime_nsec = i64::from(since.subsec_nanos());
             }
         }
-        st.st_nlink = if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            2
-        } else {
-            1
-        };
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            st.st_nlink = 2;
+        } else if st.st_nlink == 0 {
+            st.st_nlink = 1;
+        }
         st.st_blocks = (st.st_size + 511) / 512;
         st.st_atime = st.st_mtime;
         st.st_atime_nsec = st.st_mtime_nsec;
@@ -412,7 +490,11 @@ impl FileSystem for WorkspaceFs {
             if is_dir(workspace.locate(space, &path).map_err(to_errno)?.as_ref()) {
                 return Err(errno(libc::EISDIR));
             }
-            workspace.remove(space, &path.to_string()).map_err(to_errno)
+            workspace
+                .remove(space, &path.to_string())
+                .map_err(to_errno)?;
+            state.inodes.unlink(&path);
+            Ok(())
         })
     }
 
@@ -457,11 +539,24 @@ impl FileSystem for WorkspaceFs {
     fn link(
         &self,
         _ctx: &Context,
-        _inode: u64,
-        _newparent: u64,
-        _newname: &CStr,
+        inode: u64,
+        newparent: u64,
+        newname: &CStr,
     ) -> io::Result<FuseEntry> {
-        Err(errno(libc::EPERM))
+        self.with(|space, workspace, state| {
+            let from = state.inodes.path(inode)?;
+            let to = child(&state.inodes.path(newparent)?, newname)?;
+            workspace
+                .link(space, &from, &to)
+                .map_err(|error| match error {
+                    Error::WrongEntry {
+                        found: "directory", ..
+                    } => errno(libc::EPERM),
+                    error => to_errno(error),
+                })?;
+            state.inodes.link(&from, &to);
+            self.entry(space, workspace, state, &to)
+        })
     }
 
     fn open(

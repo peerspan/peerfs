@@ -210,3 +210,68 @@ fn git_works_in_a_mounted_workspace() {
     fixture.mount.take().unwrap().unmount().unwrap();
     assert!(listing(&root).is_empty(), "unmounted");
 }
+
+#[test]
+fn hard_links_share_one_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(fixture) = fixture() else { return };
+    let root = &fixture.root;
+
+    // A committed file is copied up, then linked; writes show through both paths.
+    fs::hard_link(root.join("src/lib.rs"), root.join("docs/lib.rs")).unwrap();
+    fs::write(root.join("docs/lib.rs"), "pub fn linked() {}\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        "pub fn linked() {}\n"
+    );
+    assert_eq!(fs::metadata(root.join("src/lib.rs")).unwrap().nlink(), 2);
+
+    // As cargo does with a build script: write a program, link it, run the link.
+    let built = root.join("tool-1234");
+    fs::write(&built, "#!/bin/sh\necho built\n").unwrap();
+    fs::set_permissions(&built, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::hard_link(&built, root.join("tool")).unwrap();
+    let out = Command::new(root.join("tool")).output().unwrap();
+    assert_eq!(out.stdout, b"built\n");
+
+    assert_eq!(
+        fs::hard_link(root.join("src"), root.join("source"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EPERM),
+        "no links to directories"
+    );
+    assert_eq!(
+        fs::hard_link(&built, root.join("run.sh"))
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::EEXIST)
+    );
+
+    // Removing one path leaves the other.
+    fs::remove_file(&built).unwrap();
+    assert_eq!(fs::metadata(root.join("tool")).unwrap().nlink(), 1);
+
+    let CommitOutcome::Committed { .. } = commit(&fixture) else {
+        panic!("expected a commit");
+    };
+    assert_eq!(
+        fs::read_to_string(root.join("docs/lib.rs")).unwrap(),
+        "pub fn linked() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        "pub fn linked() {}\n"
+    );
+    assert_eq!(listing(root), ["docs", "run.sh", "src", "tool"]);
+
+    // The commit made them separate files. The kernel may keep the old entry for a TTL.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(root.join("docs/lib.rs"), "pub fn apart() {}\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        "pub fn linked() {}\n"
+    );
+    assert_eq!(fs::metadata(root.join("src/lib.rs")).unwrap().nlink(), 1);
+}

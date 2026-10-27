@@ -711,6 +711,51 @@ impl Workspace {
         Ok(local)
     }
 
+    /// Makes `to` a hard link to the file or link at `from`, in a directory that exists,
+    /// and returns its local path. A base entry is copied up first, so both paths share one
+    /// overlay file: a write through either changes both, and a commit takes each path's
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::WrongEntry`] if `from` is a directory, [`Error::Exists`] if
+    /// something is at `to`, [`Error::NotFound`] if `from` or the directory of `to` is
+    /// missing, or on a store or file system error.
+    pub fn link(&mut self, space: &Space, from: &TreePath, to: &TreePath) -> Result<PathBuf> {
+        let Some((to_parent, _)) = to.split_last() else {
+            return Err(Error::Exists(to.to_string()));
+        };
+        let source_is_dir = match self.locate(space, from)? {
+            Some(Located::Local(local)) => local.is_dir() && !local.is_symlink(),
+            Some(Located::Base(entry)) => matches!(entry, Entry::Tree(_)),
+            None => return Err(Error::NotFound(from.to_string())),
+        };
+        if source_is_dir {
+            return Err(Error::WrongEntry {
+                path: from.to_string(),
+                found: "directory",
+            });
+        }
+        if self.locate(space, to)?.is_some() {
+            return Err(Error::Exists(to.to_string()));
+        }
+        match self.locate(space, &to_parent)? {
+            Some(Located::Base(Entry::Tree(_))) => make_dirs(&self.upper_path(&to_parent))?,
+            Some(Located::Local(local)) if local.is_dir() => {}
+            Some(_) => {
+                return Err(Error::WrongEntry {
+                    path: to_parent.to_string(),
+                    found: "file",
+                });
+            }
+            None => return Err(Error::NotFound(to_parent.to_string())),
+        }
+        let local_from = self.copy_up(space, from)?;
+        let local_to = self.upper_path(to);
+        fs::hard_link(&local_from, &local_to).map_err(|e| Error::io("linking", &local_to, e))?;
+        Ok(local_to)
+    }
+
     /// Removes the empty directory at `path`.
     ///
     /// # Errors
