@@ -17,7 +17,8 @@
 //!   that content. Stamps persist, so neither a commit nor a new mount makes unchanged
 //!   files look modified.
 //! - The mount keeps one view of the workspace and reloads it only when the local API
-//!   has changed its state or removals.
+//!   has changed its state or removals. It keeps recently used overlay files open, and
+//!   closes them all when the local API changes the overlay's files.
 //!
 //! - A hard link shares one overlay file and one inode number between its paths, copying
 //!   a base file up first. A commit takes each path's content, so afterwards they are
@@ -54,6 +55,9 @@ const TTL: Duration = Duration::from_secs(1);
 /// Base files kept decoded for reads, and their total size.
 const CACHED_FILES: usize = 16;
 const CACHED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Overlay files kept open for reads and writes.
+const OPEN_FILES: usize = 128;
 
 /// Threads serving FUSE requests. Requests serialize on the space's lock anyway.
 const THREADS: usize = 2;
@@ -209,6 +213,53 @@ impl Cache {
     }
 }
 
+/// What a file is open for. Open for writing, it can be read too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Access {
+    Read,
+    Write,
+}
+
+/// Overlay files held open by path, so reads and writes neither reopen nor locate them.
+/// The mount forgets a path before changing what is there itself, and every path when
+/// another value of the workspace changes the overlay, so an open file is always the one at
+/// its path.
+#[derive(Debug, Default)]
+struct OpenFiles {
+    files: HashMap<TreePath, (File, Access)>,
+}
+
+impl OpenFiles {
+    fn get(&self, path: &TreePath, access: Access) -> Option<&File> {
+        self.files
+            .get(path)
+            .filter(|(_, open)| *open >= access)
+            .map(|(file, _)| file)
+    }
+
+    fn open(&mut self, path: &TreePath, local: &Path, access: Access) -> io::Result<()> {
+        let file = FsOpenOptions::new()
+            .read(true)
+            .write(access == Access::Write)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(local)?;
+        if self.files.len() >= OPEN_FILES {
+            self.files.clear();
+        }
+        self.files.insert(path.clone(), (file, access));
+        Ok(())
+    }
+
+    /// Forgets `path` and everything under it.
+    fn forget(&mut self, path: &TreePath) {
+        self.files.retain(|open, _| !open.starts_with(path));
+    }
+
+    fn clear(&mut self) {
+        self.files.clear();
+    }
+}
+
 /// What the mount remembers between requests.
 #[derive(Debug)]
 struct State {
@@ -216,6 +267,7 @@ struct State {
     /// The workspace as last read, reused while it is current.
     workspace: Option<Workspace>,
     cache: Cache,
+    files: OpenFiles,
 }
 
 /// A workspace of a space, as a file system.
@@ -243,6 +295,7 @@ impl WorkspaceFs {
                 inodes: Inodes::new(),
                 workspace: None,
                 cache: Cache::default(),
+                files: OpenFiles::default(),
             }),
             uid,
             gid,
@@ -260,6 +313,7 @@ impl WorkspaceFs {
             Some(workspace) if workspace.is_current() => workspace,
             _ => {
                 let workspace = space.workspace(&self.workspace).map_err(to_errno)?;
+                state.files.clear();
                 // A commit or the local API may have turned a link's paths into separate
                 // files.
                 state
@@ -273,6 +327,9 @@ impl WorkspaceFs {
                 workspace
             }
         };
+        if workspace.overlay_changed_elsewhere() {
+            state.files.clear();
+        }
         let done = work(&mut space, &mut workspace, &mut state);
         state.workspace = Some(workspace);
         done
@@ -363,6 +420,7 @@ impl WorkspaceFs {
     fn make(&self, parent: u64, name: &CStr, new: NewEntry<'_>) -> io::Result<FuseEntry> {
         self.with(|space, workspace, state| {
             let path = child(&state.inodes.path(parent)?, name)?;
+            state.files.forget(&path);
             workspace
                 .create_entry(space, &path, new)
                 .map_err(to_errno)?;
@@ -491,6 +549,7 @@ impl FileSystem for WorkspaceFs {
             if is_dir(workspace.locate(space, &path).map_err(to_errno)?.as_ref()) {
                 return Err(errno(libc::EISDIR));
             }
+            state.files.forget(&path);
             workspace
                 .remove(space, &path.to_string())
                 .map_err(to_errno)?;
@@ -507,6 +566,7 @@ impl FileSystem for WorkspaceFs {
                 Some(located) if !is_dir(Some(&located)) => return Err(errno(libc::ENOTDIR)),
                 Some(_) => {}
             }
+            state.files.forget(&path);
             workspace.remove_dir(space, &path).map_err(to_errno)
         })
     }
@@ -531,6 +591,8 @@ impl FileSystem for WorkspaceFs {
             {
                 return Err(errno(libc::EEXIST));
             }
+            state.files.forget(&from);
+            state.files.forget(&to);
             workspace.rename(space, &from, &to).map_err(to_errno)?;
             state.inodes.rename(&from, &to);
             Ok(())
@@ -547,6 +609,7 @@ impl FileSystem for WorkspaceFs {
         self.with(|space, workspace, state| {
             let from = state.inodes.path(inode)?;
             let to = child(&state.inodes.path(newparent)?, newname)?;
+            state.files.forget(&to);
             workspace
                 .link(space, &from, &to)
                 .map_err(|error| match error {
@@ -595,20 +658,17 @@ impl FileSystem for WorkspaceFs {
     ) -> io::Result<usize> {
         let bytes = self.with(|space, workspace, state| {
             let path = state.inodes.path(inode)?;
+            if let Some(file) = state.files.get(&path, Access::Read) {
+                return read_at(file, size, offset);
+            }
             match workspace.locate(space, &path).map_err(to_errno)? {
                 Some(Located::Local(local)) => {
-                    let file = File::open(local)?;
-                    let mut buffer = vec![0; to_usize(size)];
-                    let mut filled = 0;
-                    while filled < buffer.len() {
-                        let read = file.read_at(&mut buffer[filled..], offset + len_u64(filled))?;
-                        if read == 0 {
-                            break;
-                        }
-                        filled += read;
-                    }
-                    buffer.truncate(filled);
-                    Ok(buffer)
+                    state.files.open(&path, &local, Access::Read)?;
+                    let file = state
+                        .files
+                        .get(&path, Access::Read)
+                        .ok_or_else(|| errno(libc::EIO))?;
+                    read_at(file, size, offset)
                 }
                 Some(Located::Base(Entry::File { content, .. })) => {
                     let bytes = state.cache.get(space, &content)?;
@@ -642,19 +702,23 @@ impl FileSystem for WorkspaceFs {
         r.read_exact(&mut data)?;
         self.with(|space, workspace, state| {
             let path = state.inodes.path(inode)?;
-            let local = workspace.copy_up(space, &path).map_err(to_errno)?;
             if flags & u32::try_from(libc::O_APPEND).unwrap_or(0) != 0 {
+                let local = workspace.copy_up(space, &path).map_err(to_errno)?;
                 FsOpenOptions::new()
                     .append(true)
                     .open(&local)?
                     .write_all(&data)?;
-            } else {
-                FsOpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&local)?
-                    .write_all_at(&data, offset)?;
+                return Ok(data.len());
             }
+            if state.files.get(&path, Access::Write).is_none() {
+                let local = workspace.copy_up(space, &path).map_err(to_errno)?;
+                state.files.open(&path, &local, Access::Write)?;
+            }
+            state
+                .files
+                .get(&path, Access::Write)
+                .ok_or_else(|| errno(libc::EIO))?
+                .write_all_at(&data, offset)?;
             Ok(data.len())
         })
     }
@@ -847,6 +911,21 @@ fn serve(server: &Server<Arc<WorkspaceFs>>, mut channel: FuseChannel) {
             Ok(None) | Err(_) => return,
         }
     }
+}
+
+/// Reads up to `size` bytes at `offset`, fewer only at the end of the file.
+fn read_at(file: &File, size: u32, offset: u64) -> io::Result<Vec<u8>> {
+    let mut buffer = vec![0; to_usize(size)];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = file.read_at(&mut buffer[filled..], offset + len_u64(filled))?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    buffer.truncate(filled);
+    Ok(buffer)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

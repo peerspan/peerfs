@@ -300,9 +300,13 @@ fn a_value_goes_stale_when_another_changes_the_workspace() {
     let mut second = space.workspace("w").expect("workspace");
     assert!(first.is_current() && second.is_current());
 
-    // Writing an overlay file changes neither state nor removals.
+    // Writing an overlay file changes neither state nor removals, but files the other
+    // value holds open may be stale.
     first.write(&space, "c.txt", b"c\n").expect("write");
     assert!(second.is_current());
+    assert!(!first.overlay_changed_elsewhere(), "its own change");
+    assert!(second.overlay_changed_elsewhere());
+    assert!(!second.overlay_changed_elsewhere(), "asking resets it");
 
     second.remove(&space, "a.txt").expect("remove");
     assert!(second.is_current(), "its own change");

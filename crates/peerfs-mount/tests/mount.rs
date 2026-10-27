@@ -275,3 +275,55 @@ fn hard_links_share_one_file() {
     );
     assert_eq!(fs::metadata(root.join("src/lib.rs")).unwrap().nlink(), 1);
 }
+
+#[test]
+fn files_the_mount_holds_open_follow_changes_through_the_api() {
+    use std::os::unix::fs::FileExt;
+
+    let Some(fixture) = fixture() else { return };
+    let root = &fixture.root;
+    let api_read = |path: &str| {
+        let space = fixture.space.lock().unwrap();
+        let ws = space.workspace("w").unwrap();
+        String::from_utf8(ws.read(&space, path).unwrap()).unwrap()
+    };
+    let api = |change: &dyn Fn(&Space, &mut peerfs_core::Workspace)| {
+        let space = fixture.space.lock().unwrap();
+        let mut ws = space.workspace("w").unwrap();
+        change(&space, &mut ws);
+    };
+
+    // The mount writes and reads, keeping the file open.
+    let notes = root.join("notes.txt");
+    fs::write(&notes, "one\n").unwrap();
+    assert_eq!(fs::read_to_string(&notes).unwrap(), "one\n");
+
+    // The API replaces the file; the mount's next write lands in the new one.
+    api(&|space, ws| ws.write(space, "notes.txt", b"two\n").unwrap());
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&notes)
+        .unwrap()
+        .write_all_at(b"T", 0)
+        .unwrap();
+    assert_eq!(api_read("notes.txt"), "Two\n");
+
+    // The API removes it and the mount creates it again, once the kernel's entry expires.
+    api(&|space, ws| ws.remove(space, "notes.txt").unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(&notes, "three\n").unwrap();
+    assert_eq!(api_read("notes.txt"), "three\n");
+
+    // The mount removes and recreates a path it held open.
+    fs::remove_file(&notes).unwrap();
+    fs::write(&notes, "four\n").unwrap();
+    assert_eq!(api_read("notes.txt"), "four\n");
+
+    // A commit empties the overlay; writing copies the file up again.
+    let CommitOutcome::Committed { .. } = commit(&fixture) else {
+        panic!("expected a commit");
+    };
+    fs::write(&notes, "five\n").unwrap();
+    assert_eq!(api_read("notes.txt"), "five\n");
+    assert_eq!(fs::read_to_string(&notes).unwrap(), "five\n");
+}

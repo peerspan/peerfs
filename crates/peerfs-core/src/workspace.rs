@@ -96,6 +96,8 @@ pub struct Workspace {
     generation: Generation,
     /// The state count as of this value's last read or write.
     seen: u64,
+    /// The overlay count as of this value's last change or check.
+    seen_overlay: u64,
     /// When each base entry was first seen at its path, loaded on first use.
     stamps: Option<HashMap<TreePath, (u64, SystemTime)>>,
 }
@@ -106,11 +108,14 @@ pub struct Workspace {
 pub(crate) struct Counts {
     /// Writes to the state and whiteouts.
     state: AtomicU64,
+    /// Overlay files created, replaced, moved or removed.
+    overlay: AtomicU64,
 }
 
 impl Counts {
     pub(crate) fn discarded(&self) {
         self.state.fetch_add(1, Ordering::AcqRel);
+        self.overlay.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -190,6 +195,7 @@ impl Workspace {
             whiteouts: BTreeSet::new(),
             base_tree: Cell::new(None),
             seen: generation.state.load(Ordering::Acquire),
+            seen_overlay: generation.overlay.load(Ordering::Acquire),
             generation,
             stamps: None,
         };
@@ -204,6 +210,7 @@ impl Workspace {
 
     pub(crate) fn open(dir: PathBuf, name: Name, generation: Generation) -> Result<Self> {
         let seen = generation.state.load(Ordering::Acquire);
+        let seen_overlay = generation.overlay.load(Ordering::Acquire);
         let state_path = dir.join(STATE);
         let state =
             fs::read_to_string(&state_path).map_err(|e| Error::io("reading", &state_path, e))?;
@@ -263,6 +270,7 @@ impl Workspace {
             base_tree: Cell::new(None),
             generation,
             seen,
+            seen_overlay,
             stamps: None,
         })
     }
@@ -273,6 +281,16 @@ impl Workspace {
     /// always read from disk, so they never make a value stale.
     pub fn is_current(&self) -> bool {
         self.generation.state.load(Ordering::Acquire) == self.seen
+    }
+
+    /// Whether another value of this workspace has created, replaced, moved or removed
+    /// overlay files since this one last did or asked, which makes overlay files held open
+    /// from before then suspect.
+    pub fn overlay_changed_elsewhere(&mut self) -> bool {
+        let now = self.generation.overlay.load(Ordering::Acquire);
+        let changed = now != self.seen_overlay;
+        self.seen_overlay = now;
+        changed
     }
 
     /// When the base entry `entry` at `path` is dated: when this workspace first saw that
@@ -440,6 +458,15 @@ impl Workspace {
         }
     }
 
+    /// Counts a change to the overlay's files, which other values may hold open.
+    fn changed_overlay(&mut self) {
+        let now = self.generation.overlay.fetch_add(1, Ordering::AcqRel) + 1;
+        // Another value's change since this one last looked still counts against it.
+        if self.seen_overlay + 1 == now {
+            self.seen_overlay = now;
+        }
+    }
+
     /// Writes the state file.
     fn save(&mut self) -> Result<()> {
         let snapshot = self
@@ -585,6 +612,7 @@ impl Workspace {
                 found: "directory",
             });
         };
+        self.changed_overlay();
         let parent = self.upper_path(&parent_path);
         let local = self.upper_path(&tree_path);
         let mode = match fs::symlink_metadata(&local) {
@@ -646,6 +674,7 @@ impl Workspace {
         let entry = self
             .base_entry(space, path)?
             .ok_or_else(|| Error::NotFound(path.to_string()))?;
+        self.changed_overlay();
         if let Some((parent, _)) = path.split_last() {
             make_dirs(&self.upper_path(&parent))?;
         }
@@ -695,6 +724,7 @@ impl Workspace {
             }
             None => return Err(Error::NotFound(parent.to_string())),
         }
+        self.changed_overlay();
         let local = self.upper_path(path);
         let created = match new {
             NewEntry::File { executable } => File::create_new(&local).and_then(|file| {
@@ -753,6 +783,7 @@ impl Workspace {
         }
         let local_from = self.copy_up(space, from)?;
         let local_to = self.upper_path(to);
+        self.changed_overlay();
         fs::hard_link(&local_from, &local_to).map_err(|e| Error::io("linking", &local_to, e))?;
         Ok(local_to)
     }
@@ -824,6 +855,7 @@ impl Workspace {
             _ => return Err(Error::NotFound(to_parent.to_string())),
         }
         let local_to = self.upper_path(to);
+        self.changed_overlay();
         fs::rename(&local_from, &local_to).map_err(|e| Error::io("renaming", &local_from, e))?;
         if from_in_base {
             self.add_whiteout(from)?;
@@ -832,6 +864,7 @@ impl Workspace {
     }
 
     fn remove_at(&mut self, space: &Space, tree_path: &TreePath) -> Result<()> {
+        self.changed_overlay();
         let tree_path = tree_path.clone();
         let local = self.upper_path(&tree_path);
         let in_upper = match fs::symlink_metadata(&local) {
