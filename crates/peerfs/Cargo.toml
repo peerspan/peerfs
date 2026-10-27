@@ -1,0 +1,15 @@
+[package]
+name = "peerfs"
+description = "Command-line interface to peerfs spaces"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+peerfs-core.workspace = true
+
+[lints]
+workspace = true
