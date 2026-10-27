@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use peerfs_api::Client;
 use peerfs_server::{pid_path, socket_path};
 
-/// How long `stop` waits for the server to remove its socket after the signal.
+/// How long `stop` waits for the server to exit after the signal.
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// What the process named by `serve.pid` turned out to be.
@@ -93,18 +93,10 @@ pub(crate) async fn stop(space_dir: &Path, out: &mut impl Write) -> Result<ExitC
         }
         bail!("could not signal the server (process {pid})");
     }
+    // Wait for the process itself: it removes its files before exiting, so only once it
+    // has exited do the files say whether it cleaned up.
     let started = Instant::now();
-    while socket.exists() {
-        if !alive(pid) {
-            // It died without cleaning up; a later server would replace both files anyway.
-            remove_stale(&socket)?;
-            remove_stale(&pid_file)?;
-            writeln!(
-                out,
-                "the server (process {pid}) exited without removing its files; removed them"
-            )?;
-            return Ok(ExitCode::SUCCESS);
-        }
+    while alive(pid) {
         if started.elapsed() > STOP_WAIT {
             bail!(
                 "the server (process {pid}) did not stop within {}s of SIGTERM; see {}",
@@ -113,6 +105,16 @@ pub(crate) async fn stop(space_dir: &Path, out: &mut impl Write) -> Result<ExitC
             );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if socket.exists() || pid_file.exists() {
+        // It died without cleaning up; a later server would replace both files anyway.
+        remove_stale(&socket)?;
+        remove_stale(&pid_file)?;
+        writeln!(
+            out,
+            "the server (process {pid}) exited without removing its files; removed them"
+        )?;
+        return Ok(ExitCode::SUCCESS);
     }
     writeln!(
         out,
@@ -221,9 +223,22 @@ fn signal(pid: u32, signal: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Whether `pid` is a process this user can signal.
+/// Whether `pid` is a running process this user can signal. A zombie, exited but not yet
+/// reaped by its parent, does not count.
 fn alive(pid: u32) -> bool {
-    signal(pid, "-0")
+    signal(pid, "-0") && !zombie(pid)
+}
+
+/// Whether `pid` has exited and waits for its parent to reap it. Only Linux says, through
+/// `/proc`; elsewhere this is always false.
+fn zombie(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        // The state follows the command name, which is in parentheses and may hold any
+        // character, so look after the last `)`.
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            == Some("Z")
+    })
 }
 
 fn remove_stale(path: &Path) -> Result<()> {
@@ -232,5 +247,25 @@ fn remove_stale(path: &Path) -> Result<()> {
             Err(e).with_context(|| format!("removing {}", path.display()))
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_exited_unreaped_child_is_not_alive() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let pid = child.id();
+        let started = Instant::now();
+        while !zombie(pid) {
+            assert!(started.elapsed() < Duration::from_secs(5), "never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(signal(pid, "-0"), "a zombie still takes signals");
+        assert!(!alive(pid));
+        child.wait().expect("reap");
+        assert!(!alive(pid));
     }
 }
