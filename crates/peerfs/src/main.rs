@@ -1,9 +1,10 @@
 //! `peerfs`: create spaces, serve them, and work in workspaces from the command line.
 //!
-//! Every command except `init`, `serve` and `stop` is a client of the space's server. When
-//! none is running, the command starts one in the background, which exits after ten idle
-//! minutes or on `peerfs stop`.
+//! Every command except `init`, `serve`, `stop` and `hook` is a client of the space's
+//! server. When none is running, the command starts one in the background, which exits
+//! after ten idle minutes or on `peerfs stop`.
 
+mod hook;
 mod stop;
 
 use std::fs::{self, OpenOptions};
@@ -135,6 +136,17 @@ enum Command {
     /// Work in a workspace.
     #[command(subcommand, name = "ws")]
     Workspace(WorkspaceCommand),
+    /// Run as an agent's hook.
+    #[command(subcommand)]
+    Hook(HookCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// A Claude Code `PostToolUse` hook: snapshots each peerfs workspace the tool call
+    /// touched, reading the hook's input on standard input. Outside a peerfs mount it does
+    /// nothing. Never starts a server.
+    ClaudeCode,
 }
 
 #[derive(Debug, Subcommand)]
@@ -276,6 +288,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Stop => stop::stop(&space_dir, &mut io::stdout().lock()).await,
+        Command::Hook(HookCommand::ClaudeCode) => {
+            let caller = Caller {
+                agent: cli.agent,
+                session: cli.session,
+            };
+            hook::claude_code(
+                &space_dir,
+                caller,
+                &mut io::stdin().lock(),
+                &mut io::stderr().lock(),
+            )
+            .await?;
+            Ok(ExitCode::SUCCESS)
+        }
         command => {
             let client = connect(&space_dir, cli.host.as_deref()).await?;
             let caller = Caller {
@@ -363,7 +389,7 @@ async fn client_command(
     out: &mut impl Write,
 ) -> Result<ExitCode> {
     match command {
-        Command::Init | Command::Serve { .. } | Command::Stop => {
+        Command::Init | Command::Serve { .. } | Command::Stop | Command::Hook(_) => {
             unreachable!("handled without a client")
         }
         Command::Import {

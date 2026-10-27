@@ -823,6 +823,8 @@ dependencies = [
  "peerfs-api",
  "peerfs-core",
  "peerfs-server",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

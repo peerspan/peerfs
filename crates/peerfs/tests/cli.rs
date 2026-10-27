@@ -344,3 +344,91 @@ fn a_mounted_workspace_is_edited_as_a_directory_and_committed() {
             .is_none()
     );
 }
+
+#[test]
+fn the_claude_code_hook_snapshots_a_mounted_workspace_after_a_tool_call() {
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .is_err()
+    {
+        return; // This machine cannot mount FUSE file systems.
+    }
+    let space = new_space();
+    let run = |args: &[&str]| ok(&peerfs(&space.path, "a", args, None));
+    let outside = space.path.parent().expect("parent");
+    let mountpoint = outside.join("mnt");
+    std::fs::create_dir(&mountpoint).expect("mountpoint");
+    let mnt = mountpoint.to_str().expect("UTF-8");
+    run(&["ws", "create", "w"]);
+    run(&["ws", "mount", "w", mnt]);
+    let hook = |space: &Path, cwd: &Path, input: &str| {
+        let call = format!(
+            r#"{{"session_id": "s1", "hook_event_name": "PostToolUse", "cwd": "{}", {input}}}"#,
+            cwd.display()
+        );
+        peerfs(space, "a", &["hook", "claude-code"], Some(&call))
+    };
+    let write = format!(
+        r#""tool_name": "Write", "tool_use_id": "toolu_1",
+           "tool_input": {{"file_path": "{mnt}/notes.txt", "content": "one"}}"#
+    );
+
+    std::fs::write(mountpoint.join("notes.txt"), "one\n").expect("write");
+    let snapped = hook(&space.path, &mountpoint, &write);
+    assert_eq!(ok(&snapped), "", "nothing on standard output");
+    let snapshots = run(&["ws", "snapshots", "w"]);
+    assert_eq!(snapshots.lines().count(), 1, "{snapshots}");
+    assert!(
+        snapshots.contains("Write: notes.txt (toolu_1)"),
+        "{snapshots}"
+    );
+
+    // Nothing changed since: no new snapshot.
+    ok(&hook(
+        &space.path,
+        &mountpoint,
+        r#""tool_name": "Read", "tool_input": {"file_path": "notes.txt"}"#,
+    ));
+    assert_eq!(run(&["ws", "snapshots", "w"]).lines().count(), 1);
+
+    // A shell command changes a file.
+    std::fs::write(mountpoint.join("notes.txt"), "two\n").expect("write");
+    ok(&hook(
+        &space.path,
+        &mountpoint.join("."),
+        r#""tool_name": "Bash", "tool_input": {"command": "echo two > notes.txt"}"#,
+    ));
+    let snapshots = run(&["ws", "snapshots", "w"]);
+    assert_eq!(snapshots.lines().count(), 2, "{snapshots}");
+    assert!(
+        snapshots
+            .lines()
+            .next()
+            .expect("newest")
+            .contains("Bash: echo two")
+    );
+
+    // Outside any peerfs mount the hook does nothing, even for a space that has no server.
+    let elsewhere = outside.join("no-such-space");
+    ok(&hook(
+        &elsewhere,
+        outside,
+        r#""tool_name": "Bash", "tool_input": {}"#,
+    ));
+    assert!(!elsewhere.exists(), "no server or space was created");
+
+    // In a mount another space serves, it says how to fix it, without starting a server.
+    std::fs::write(mountpoint.join("notes.txt"), "three\n").expect("write");
+    let wrong = hook(&elsewhere, &mountpoint, &write);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("PEERFS_SPACE"),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+    assert!(!elsewhere.exists());
+
+    run(&["ws", "unmount", "w"]);
+}

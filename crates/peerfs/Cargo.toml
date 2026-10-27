@@ -12,6 +12,8 @@ clap.workspace = true
 peerfs-api.workspace = true
 peerfs-core.workspace = true
 peerfs-server.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
