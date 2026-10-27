@@ -14,16 +14,20 @@ struct Running {
 }
 
 async fn start(idle_timeout: Option<Duration>) -> Running {
+    start_on("server-host", idle_timeout).await
+}
+
+async fn start_on(host: &str, idle_timeout: Option<Duration>) -> Running {
     let dir = tempfile::tempdir().expect("temporary directory");
     let space_dir = dir.path().join("s");
     let author = Author {
-        host: "server-host".to_owned(),
+        host: host.to_owned(),
         ..Author::default()
     };
     let space = Space::init(&space_dir, &author).expect("init");
     let socket = socket_path(&space_dir);
     let options = Options {
-        host: "server-host".to_owned(),
+        host: host.to_owned(),
         idle_timeout,
     };
     let server = tokio::spawn(serve(space, options));
@@ -243,4 +247,110 @@ async fn an_idle_server_stops_and_removes_its_socket() {
     assert!(!peerfs_server::pid_path(&running.space_dir).exists());
     // The space is free for the next process.
     Space::open(&running.space_dir).unwrap();
+}
+
+async fn commit_files(client: &Client, workspace: &str, files: &[(&str, &str)]) {
+    if client.workspace(workspace).await.is_err() {
+        client
+            .create_workspace(workspace, "main")
+            .await
+            .expect("create workspace");
+    }
+    for (path, text) in files {
+        client
+            .write(workspace, path, text.to_string())
+            .await
+            .expect("write");
+    }
+    let response = client
+        .commit(workspace, "files", &caller("setup"))
+        .await
+        .expect("commit");
+    assert!(
+        matches!(response, CommitResponse::Committed { .. }),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_server_pulls_another_servers_branch_and_works_from_it() {
+    let server = start_on("server", None).await;
+    let laptop = start_on("laptop", None).await;
+    commit_files(
+        &server.client,
+        "w",
+        &[("a.txt", "a\n"), ("src/b.rs", "fn b() {}\n")],
+    )
+    .await;
+
+    let from = server.client.socket().to_str().unwrap().to_owned();
+    let pulled = laptop.client.pull(&from, "main").await.unwrap();
+    assert_eq!(pulled.remote, "server");
+    assert!(pulled.objects > 0);
+    let remotes = laptop.client.remotes().await.unwrap();
+    assert_eq!(remotes.len(), 1);
+    assert_eq!(remotes[0].head, pulled.head);
+
+    // Work starts from a fork of the tracking reference.
+    laptop.client.fork("work", "server/main").await.unwrap();
+    laptop
+        .client
+        .create_workspace("mine", "work")
+        .await
+        .unwrap();
+    assert_eq!(
+        &laptop.client.read("mine", "src/b.rs").await.unwrap()[..],
+        b"fn b() {}\n"
+    );
+    assert_eq!(
+        laptop.client.log("server/main", None).await.unwrap()[0].id,
+        pulled.head
+    );
+
+    let again = laptop.client.pull(&from, "main").await.unwrap();
+    assert_eq!(again.objects, 0);
+}
+
+#[tokio::test]
+async fn two_servers_pulling_from_each_other_at_once_both_finish() {
+    let a = start_on("host-a", None).await;
+    let b = start_on("host-b", None).await;
+    let many: Vec<(String, String)> = (0..600)
+        .map(|i| (format!("f/{i}.txt"), format!("file {i}\n")))
+        .collect();
+    let many: Vec<(&str, &str)> = many.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+    commit_files(&a.client, "w", &many).await;
+    commit_files(&b.client, "w", &many[..300]).await;
+
+    let from_a = a.client.socket().to_str().unwrap().to_owned();
+    let from_b = b.client.socket().to_str().unwrap().to_owned();
+    let both = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(
+            b.client.pull(&from_a, "main"),
+            a.client.pull(&from_b, "main")
+        )
+    })
+    .await
+    .expect("neither pull waits on the other forever");
+    both.0.unwrap();
+    both.1.unwrap();
+}
+
+#[tokio::test]
+async fn pull_and_fetch_reject_bad_requests() {
+    let server = start_on("server", None).await;
+    let own = server.client.socket().to_str().unwrap().to_owned();
+    let itself = server.client.pull(&own, "main").await.unwrap_err();
+    assert_eq!(itself.code(), Some("invalid"));
+
+    let nowhere = server
+        .client
+        .pull("/nonexistent/peerfs.sock", "main")
+        .await
+        .unwrap_err();
+    assert_eq!(nowhere.code(), Some("remote"));
+
+    let too_many: Vec<String> = (0..300).map(|_| "00".repeat(33)).collect();
+    let refused = server.client.fetch_objects(&too_many).await.unwrap_err();
+    assert_eq!(refused.code(), Some("invalid"));
 }

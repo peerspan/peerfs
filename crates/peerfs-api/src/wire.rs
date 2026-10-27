@@ -220,3 +220,52 @@ pub enum CommitResponse {
     /// The workspace had no changes.
     Unchanged,
 }
+
+/// `POST /v1/objects/fetch`: objects by id, at most 256. The response is the objects this
+/// space holds, encoded as `application/octet-stream` by `peerfs_core::encode_objects`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchRequest {
+    /// The objects wanted.
+    pub ids: Vec<String>,
+}
+
+/// `POST /v1/pull`: fetch a branch and its history from another space's server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullRequest {
+    /// The other server's socket, on this host.
+    pub from: String,
+    /// The branch there.
+    pub branch: String,
+}
+
+/// What a pull did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PullResponse {
+    /// The other server's host, which names the tracking reference.
+    pub remote: String,
+    /// The branch pulled.
+    pub branch: String,
+    /// Its head, now held here as `<remote>/<branch>`.
+    pub head: String,
+    /// Objects fetched.
+    pub objects: u64,
+    /// Their uncompressed bytes.
+    pub bytes: u64,
+}
+
+/// One tracking reference of `GET /v1/remotes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrackingInfo {
+    /// The host it came from.
+    pub remote: String,
+    /// The branch there.
+    pub branch: String,
+    /// Its head when pulled.
+    pub head: String,
+    /// When it was pulled, in milliseconds since the Unix epoch.
+    pub pulled_ms: u64,
+}

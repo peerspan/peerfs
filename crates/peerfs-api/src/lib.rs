@@ -13,8 +13,9 @@ pub use client::{Client, ClientError, RawResponse};
 pub use hyper::Method;
 pub use wire::{
     BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse, ConflictInfo,
-    CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest, ForkRequest,
-    ImportRequest, Revision, SpaceInfo, WorkspaceInfo,
+    CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest, FetchRequest,
+    ForkRequest, ImportRequest, PullRequest, PullResponse, Revision, SpaceInfo, TrackingInfo,
+    WorkspaceInfo,
 };
 
 /// The socket's file name inside the space directory.

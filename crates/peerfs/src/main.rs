@@ -78,6 +78,15 @@ enum Command {
     },
     /// List branches and their heads.
     Branches,
+    /// Fetch another space's branch and its history, kept as `<host>/<branch>`.
+    Pull {
+        /// The other space's directory, on this host.
+        from: PathBuf,
+        #[arg(long, default_value = "main")]
+        branch: String,
+    },
+    /// List branches pulled from other hosts, as of their last pull.
+    Remotes,
     /// Create a branch at another branch's head. Copies no data.
     Fork {
         /// The new branch.
@@ -311,6 +320,35 @@ async fn client_command(
         Command::Branches => {
             for branch in client.branches().await? {
                 writeln!(out, "{} {}", branch.head, branch.name)?;
+            }
+        }
+        Command::Pull { from, branch } => {
+            let from = std::path::absolute(&from)
+                .with_context(|| format!("resolving {}", from.display()))?;
+            // The other space's server answers the pull; start it if it is not running.
+            let other = connect(&from, None).await?;
+            let socket = other
+                .socket()
+                .to_str()
+                .with_context(|| format!("{} is not UTF-8", from.display()))?
+                .to_owned();
+            let pulled = client.pull(&socket, &branch).await?;
+            writeln!(
+                out,
+                "{} {}/{} ({} objects, {} bytes fetched)",
+                pulled.head, pulled.remote, pulled.branch, pulled.objects, pulled.bytes
+            )?;
+        }
+        Command::Remotes => {
+            for tracking in client.remotes().await? {
+                writeln!(
+                    out,
+                    "{} {}/{} pulled at {}",
+                    tracking.head,
+                    tracking.remote,
+                    tracking.branch,
+                    tracking.pulled_ms / 1000
+                )?;
             }
         }
         Command::Fork { name, from } => {

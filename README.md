@@ -9,7 +9,7 @@ selectively is the broader one.
 
 The design and its agreed decisions are in `peerspan/docs-internal`, `docs/peerfs.md`.
 
-## Status: milestones 1 and 2, the local core and its server
+## Status: milestones 1 and 2, and slice 1 of 3a (pulling between spaces)
 
 What works today, on one host:
 
@@ -22,9 +22,10 @@ What works today, on one host:
 | Branches | Move only by compare-and-swap, written by sync and rename; forking copies nothing | — |
 | Workspaces | A writable overlay over a commit; every write synced before it returns | 3, 4 |
 | Commit | Fast path when the branch has not moved; otherwise a three-way merge onto the new head. Text up to 1 MiB merges by line; a conflict commits nothing and leaves markers in the workspace to resolve | 2 |
+| Pull | Fetches another space's branch and its whole history, only the objects missing here, each checked against its identity and expected kind; records it as the tracking reference `<host>/<branch>`. The store stays closed (it holds an object only with everything it references), so an interrupted pull leaves no reference and resumes. Between spaces on one host for now; across hosts through the daemons in 3b | 3, 8 |
 | Server | `peerfs serve` owns the space and serves it at `<space>/peerfs.sock`, so concurrent agents serialize through it; it exits after an idle timeout, on SIGTERM and on `peerfs stop` | 4 |
 | API | HTTP/1.1 and JSON over the Unix socket, following the host daemon's `admin.sock` conventions; a Rust client in `peerfs-api` | 4, 9 |
-| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / discard` | 4 |
+| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `pull`, `remotes`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / discard` | 4 |
 
 Not yet: signing, replication between hosts and durability receipts, owner rules for
 conflicts (`regenerate`, `ours`/`theirs`, structured merge), source/derived/secret path
@@ -36,7 +37,9 @@ and the server applies requests one at a time. Linux and macOS only.
 
 `peerfs serve` listens on `<space>/peerfs.sock` (mode 0600) and writes `<space>/serve.pid`.
 Requests and responses are JSON under `/v1`; errors are `{"code", "error"}` with `invalid`
-(400), `not_found` (404), `conflict` (409) or `internal` (500); unknown fields are rejected.
+(400), `not_found` (404), `conflict` (409), `remote` (502, another host failed or sent
+something unusable) or `internal` (500); unknown fields are rejected. Wherever a branch is
+named, `<host>/<branch>` names a tracking reference.
 File contents are raw bodies. Commits record the server's host and the agent and session
 the request names.
 
@@ -52,6 +55,9 @@ the request names.
 | `GET /v1/workspaces/{name}/list?path=dir` | List a directory |
 | `GET /v1/workspaces/{name}/changes` | Uncommitted changes |
 | `POST /v1/workspaces/{name}/commit` | Commit (`{message, caller}`); the outcome is `committed`, `conflicted` or `unchanged` |
+| `POST /v1/objects/fetch` | Objects by id (`{ids}`, at most 256), as `application/octet-stream`; those not held are left out |
+| `POST /v1/pull` | Pull a branch from another server (`{from, branch}`, `from` its socket); the space is held only between fetches |
+| `GET /v1/remotes` | Tracking references, with when each was pulled |
 
 ## Try it
 

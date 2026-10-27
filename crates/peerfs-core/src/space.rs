@@ -16,6 +16,7 @@ use crate::object::{
 use crate::path::TreePath;
 use crate::refs::Refs;
 use crate::store::{Store, sync_dir};
+use crate::sync::{Pull, Pulled, RawObject, Remote, Tracking, TrackingRefs};
 use crate::workspace::Workspace;
 
 /// The first line of a space's `FORMAT` file.
@@ -38,6 +39,7 @@ pub struct Space {
     dir: PathBuf,
     store: Store,
     refs: Refs,
+    tracking: TrackingRefs,
     _lock: File,
 }
 
@@ -152,6 +154,7 @@ impl Space {
             dir: dir.to_owned(),
             store: Store::open(&dir.join("objects"))?,
             refs: Refs::new(dir.join("refs/branches")),
+            tracking: TrackingRefs::new(dir.join("refs/remotes")),
             _lock: lock,
         })
     }
@@ -164,6 +167,109 @@ impl Space {
     /// The number of objects stored.
     pub fn object_count(&self) -> usize {
         self.store.len()
+    }
+
+    /// Whether the space holds `id` and, the store being closed, everything it reaches.
+    pub fn contains(&self, id: &ObjectId) -> bool {
+        self.store.contains(id)
+    }
+
+    /// An object as stored, checked against its identity, for sending to another host.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the object is corrupt or cannot be read.
+    pub fn raw_object(&self, id: ObjectId) -> Result<Option<RawObject>> {
+        Ok(self
+            .store
+            .get(&id)?
+            .map(|(kind, bytes)| RawObject { id, kind, bytes }))
+    }
+
+    /// Fetches `branch` and all its history from the host `from` through `remote`, and
+    /// records its head as the tracking reference `<from>/<branch>`.
+    ///
+    /// Only objects this space lacks are fetched. Every object is checked against its
+    /// identity and expected kind before it is stored. A pull that fails part way changes
+    /// no reference, and the next pull fetches what is left.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the remote cannot be reached, lacks the branch or an object of its
+    /// history, or sends an object that does not match.
+    pub fn pull(&mut self, remote: &mut dyn Remote, from: &str, branch: &str) -> Result<Pulled> {
+        let head = remote
+            .branch(branch)?
+            .ok_or_else(|| Error::NoSuchBranch(format!("{from}/{branch}")))?;
+        let mut pull = self.start_pull(from, branch, head)?;
+        loop {
+            let wanted = pull.wanted();
+            if wanted.is_empty() {
+                return self.finish_pull(pull);
+            }
+            let objects = remote.fetch(&wanted)?;
+            self.receive(&mut pull, objects)?;
+        }
+    }
+
+    /// Starts pulling `head`, the head of `branch` on the host `from`, step by step; see
+    /// [`Pull`]. [`Space::pull`] does every step for a [`Remote`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if a name is invalid.
+    pub fn start_pull(&self, from: &str, branch: &str, head: ObjectId) -> Result<Pull> {
+        Ok(Pull::new(
+            &self.store,
+            Name::try_from(from)?,
+            branch_name(branch)?,
+            head,
+        ))
+    }
+
+    /// Takes in the objects fetched for [`Pull::wanted`], checking each against its identity
+    /// and expected kind.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a wanted object is missing or does not match, or on a store error.
+    pub fn receive(&mut self, pull: &mut Pull, objects: Vec<RawObject>) -> Result<()> {
+        pull.receive(&mut self.store, objects)
+    }
+
+    /// Completes a pull once nothing is wanted: stores what was held back, makes it
+    /// durable, and records the tracking reference.
+    ///
+    /// # Errors
+    ///
+    /// Fails if objects are still wanted, or on a store error.
+    pub fn finish_pull(&mut self, pull: Pull) -> Result<Pulled> {
+        pull.finish(&mut self.store, &self.tracking)
+    }
+
+    /// Every tracking reference: other hosts' branch heads as of their last pull.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a reference cannot be read.
+    pub fn tracking(&self) -> Result<Vec<Tracking>> {
+        self.tracking.list()
+    }
+
+    /// The commit `revision` names: a local branch, or `<remote>/<branch>` for the head
+    /// last pulled from another host.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a name is invalid or a reference cannot be read.
+    pub fn resolve(&self, revision: &str) -> Result<Option<ObjectId>> {
+        match revision.split_once('/') {
+            Some((remote, branch)) => Ok(self
+                .tracking
+                .get(&Name::try_from(remote)?, &branch_name(branch)?)?
+                .map(|tracking| tracking.head)),
+            None => self.branch(revision),
+        }
     }
 
     /// Makes every object written so far durable on this host.

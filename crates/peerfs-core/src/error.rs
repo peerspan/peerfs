@@ -113,6 +113,17 @@ pub enum Error {
         /// Why.
         reason: &'static str,
     },
+    /// Another host could not be reached or answered something unusable.
+    #[error("remote: {0}")]
+    Remote(String),
+    /// An object another host sent, or failed to send, cannot be accepted.
+    #[error("remote object {id} {problem}")]
+    RemoteObject {
+        /// The object.
+        id: ObjectId,
+        /// What was wrong.
+        problem: &'static str,
+    },
 }
 
 impl Error {

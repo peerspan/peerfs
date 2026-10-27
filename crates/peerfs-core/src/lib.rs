@@ -33,6 +33,7 @@ mod path;
 mod refs;
 mod space;
 mod store;
+mod sync;
 mod workspace;
 
 pub use codec::DecodeError;
@@ -44,4 +45,7 @@ pub use object::{
 };
 pub use path::TreePath;
 pub use space::{CommitOutcome, DEFAULT_BRANCH, Merged, Space};
+pub use sync::{
+    FETCH_BATCH, Pull, Pulled, RawObject, Remote, Tracking, decode_objects, encode_objects,
+};
 pub use workspace::{Change, EntryKind, Workspace};

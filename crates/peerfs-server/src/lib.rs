@@ -21,12 +21,14 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use peerfs_api::{
-    BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse, ConflictInfo,
-    CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest, ForkRequest,
-    ImportRequest, Revision, SOCKET_NAME, SpaceInfo, WorkspaceInfo,
+    BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest, CommitResponse,
+    ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest,
+    FetchRequest, ForkRequest, ImportRequest, PullRequest, PullResponse, Revision, SOCKET_NAME,
+    SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 use peerfs_core::{
-    Author, Change, CommitOutcome, ConflictKind, Error, Merged, ObjectId, Space, Workspace,
+    Author, Change, CommitOutcome, ConflictKind, Error, FETCH_BATCH, Merged, ObjectId, Space,
+    Workspace, decode_objects, encode_objects,
 };
 use serde::Deserialize;
 use tokio::net::UnixListener;
@@ -100,6 +102,9 @@ fn router_with(state: AppState) -> Router {
         .route("/v1/workspaces/{name}/list", get(list))
         .route("/v1/workspaces/{name}/changes", get(changes))
         .route("/v1/workspaces/{name}/commit", post(commit))
+        .route("/v1/objects/fetch", post(fetch_objects))
+        .route("/v1/pull", post(pull))
+        .route("/v1/remotes", get(remotes))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
@@ -216,6 +221,15 @@ impl ApiError {
         }
     }
 
+    /// Another host failed or sent something unusable.
+    fn remote(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "remote",
+            message: message.into(),
+        }
+    }
+
     fn internal(detail: &dyn std::fmt::Display) -> Self {
         log_internal(detail);
         Self {
@@ -252,6 +266,7 @@ impl From<Error> for ApiError {
             | Error::InvalidPath(_)
             | Error::WrongEntry { .. }
             | Error::Unsupported { .. } => (StatusCode::BAD_REQUEST, "invalid"),
+            Error::Remote(_) | Error::RemoteObject { .. } => (StatusCode::BAD_GATEWAY, "remote"),
             _ => return Self::internal(&error),
         };
         Self {
@@ -259,6 +274,12 @@ impl From<Error> for ApiError {
             code,
             message,
         }
+    }
+}
+
+impl From<ClientError> for ApiError {
+    fn from(error: ClientError) -> Self {
+        Self::remote(error.to_string())
     }
 }
 
@@ -309,10 +330,11 @@ fn author(host: &str, caller: Caller) -> Author {
     }
 }
 
-fn head(space: &Space, branch: &str) -> ApiResult<ObjectId> {
+/// The commit a branch, or a tracking reference `<remote>/<branch>`, points at.
+fn head(space: &Space, revision: &str) -> ApiResult<ObjectId> {
     space
-        .branch(branch)?
-        .ok_or_else(|| ApiError::not_found(format!("no branch {branch}")))
+        .resolve(revision)?
+        .ok_or_else(|| ApiError::not_found(format!("no branch {revision}")))
 }
 
 fn workspace_info(workspace: &Workspace) -> WorkspaceInfo {
@@ -641,6 +663,126 @@ async fn commit(
             other => return Err(ApiError::internal(&format!("{other:?}"))),
         };
         Ok(Json(response))
+    })
+    .await
+}
+
+async fn fetch_objects(
+    State(state): State<AppState>,
+    body: Result<Json<FetchRequest>, JsonRejection>,
+) -> ApiResult<Response> {
+    let Json(request) = body?;
+    if request.ids.len() > FETCH_BATCH {
+        return Err(ApiError::invalid(format!(
+            "at most {FETCH_BATCH} objects per fetch, not {}",
+            request.ids.len()
+        )));
+    }
+    let ids = request
+        .ids
+        .iter()
+        .map(|id| {
+            id.parse::<ObjectId>()
+                .map_err(|e| ApiError::invalid(format!("object {id}: {e}")))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    let encoded = with_space(&state, move |space, _| {
+        let mut objects = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(object) = space.raw_object(id)? {
+                objects.push(object);
+            }
+        }
+        Ok(encode_objects(&objects))
+    })
+    .await?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    )
+        .into_response())
+}
+
+/// Pulls from another server, holding the space only between network waits, so two
+/// servers pulling from each other cannot deadlock.
+async fn pull(
+    State(state): State<AppState>,
+    body: Result<Json<PullRequest>, JsonRejection>,
+) -> ApiResult<Json<PullResponse>> {
+    let Json(request) = body?;
+    let from = absolute(&request.from)?.to_owned();
+    let remote = Client::new(&from);
+    let info = remote.space().await?;
+    let own = with_space(&state, |space, _| Ok(space.path().to_owned())).await?;
+    let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if same(Path::new(&info.path), &own) {
+        return Err(ApiError::invalid("a space cannot pull from itself"));
+    }
+    let head = remote
+        .branches()
+        .await?
+        .into_iter()
+        .find(|branch| branch.name == request.branch)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("no branch {} on {}", request.branch, info.host))
+        })?
+        .head;
+    let head: ObjectId = head
+        .parse()
+        .map_err(|e| ApiError::remote(format!("{} sent head {head}: {e}", info.host)))?;
+    let (host, branch) = (info.host.clone(), request.branch.clone());
+    let mut pending = with_space(&state, move |space, _| {
+        Ok(space.start_pull(&host, &branch, head)?)
+    })
+    .await?;
+    loop {
+        let wanted = pending.wanted();
+        if wanted.is_empty() {
+            break;
+        }
+        let ids: Vec<String> = wanted.iter().map(ToString::to_string).collect();
+        let bytes = remote.fetch_objects(&ids).await?;
+        let objects = decode_objects(&bytes).map_err(|e| {
+            ApiError::remote(format!("{} sent undecodable objects: {e}", info.host))
+        })?;
+        pending = with_space(&state, move |space, _| {
+            space.receive(&mut pending, objects)?;
+            Ok(pending)
+        })
+        .await?;
+    }
+    let pulled = with_space(&state, move |space, _| Ok(space.finish_pull(pending)?)).await?;
+    Ok(Json(PullResponse {
+        remote: info.host,
+        branch: request.branch,
+        head: pulled.head.to_string(),
+        objects: pulled.objects,
+        bytes: pulled.bytes,
+    }))
+}
+
+async fn remotes(State(state): State<AppState>) -> ApiResult<Json<Vec<TrackingInfo>>> {
+    with_space(&state, |space, _| {
+        Ok(Json(
+            space
+                .tracking()?
+                .into_iter()
+                .map(|tracking| TrackingInfo {
+                    remote: tracking.remote,
+                    branch: tracking.branch,
+                    head: tracking.head.to_string(),
+                    pulled_ms: tracking
+                        .pulled
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |since| {
+                            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+                        }),
+                })
+                .collect(),
+        ))
     })
     .await
 }

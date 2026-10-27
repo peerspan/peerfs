@@ -14,8 +14,8 @@ use tokio::net::UnixStream;
 
 use crate::wire::{
     BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
-    CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, ForkRequest, ImportRequest,
-    Revision, SpaceInfo, WorkspaceInfo,
+    CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
+    ImportRequest, PullRequest, PullResponse, Revision, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -284,6 +284,40 @@ impl Client {
         self.call_json(Method::POST, "/v1/export", Some(&request))
             .await
             .map(drop)
+    }
+
+    /// The objects among `ids` this space holds, encoded by `peerfs_core::encode_objects`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `invalid` for more than 256 ids or a malformed id.
+    pub async fn fetch_objects(&self, ids: &[String]) -> Result<Bytes, ClientError> {
+        let request = FetchRequest { ids: ids.to_vec() };
+        self.call_json(Method::POST, "/v1/objects/fetch", Some(&request))
+            .await
+    }
+
+    /// Has this server pull `branch` and its history from the server at `from`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the other server cannot be reached, lacks the branch, or sends objects
+    /// that do not match.
+    pub async fn pull(&self, from: &str, branch: &str) -> Result<PullResponse, ClientError> {
+        let request = PullRequest {
+            from: from.to_owned(),
+            branch: branch.to_owned(),
+        };
+        self.json(Method::POST, "/v1/pull", Some(&request)).await
+    }
+
+    /// Every tracking reference: other hosts' branch heads as of their last pull.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server cannot be reached or answers with an error.
+    pub async fn remotes(&self) -> Result<Vec<TrackingInfo>, ClientError> {
+        self.json(Method::GET, "/v1/remotes", None::<&()>).await
     }
 
     /// Every workspace.
