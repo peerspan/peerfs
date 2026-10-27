@@ -9,7 +9,7 @@ selectively is the broader one.
 
 The design and its agreed decisions are in `peerspan/docs-internal`, `docs/peerfs.md`.
 
-## Status: milestones 1 and 2, and slices 1 to 3 of 3a (pull, push and merge between spaces, signed commits)
+## Status: milestones 1 and 2, and slices 1 to 4 of 3a (pull, push and merge between spaces, signed commits, snapshots)
 
 What works today, on one host:
 
@@ -24,11 +24,12 @@ What works today, on one host:
 | Commit | Fast path when the branch has not moved; otherwise a three-way merge onto the new head. Text up to 1 MiB merges by line; a conflict commits nothing and leaves markers in the workspace to resolve | 2 |
 | Pull | Fetches another space's branch and its whole history, only the objects missing here, each checked against its identity and expected kind; records it as the tracking reference `<host>/<branch>`. The store stays closed (it holds an object only with everything it references), so an interrupted pull leaves no reference and resumes. Between spaces on one host for now; across hosts through the daemons in 3b | 3, 8 |
 | Push | Sends a branch to the space that holds it: asks which objects it lacks (a held object needs nothing beneath it sent), sends those children first, and the receiver refuses any object that does not match or references one it lacks. The home host moves its branch only by compare-and-swap against the head the pusher last pulled, and only as a fast-forward, so a push never drops commits it did not see | 2, 3 |
+| Snapshots | `ws snapshot`, meant once per tool call, stores the workspace's tree as an unsigned commit for its current change, chained to the change's previous snapshot; the branch and overlay are untouched and snapshots never leave the host. `ws commit` ends the change: it takes a last snapshot, merges onto the moved head, and stores one signed commit whose `predecessor` names that snapshot. The link is weak, so pushing and pulling never carry snapshots | 1 |
 | Signing | Every commit is signed with Ed25519 when stored; the signature covers a domain-separated encoding of the commit and is part of its identity. A commit pulled or pushed in is refused unless it is signed by a key listed for the host it names as its author. For now a space signs with its own `signing.key` and trusts the keys in its `hosts` file (`peerfs key`, `peerfs hosts add`); in 3b the host daemon signs and supplies peers' keys, behind the same `Signer` and `HostKeys` traits | 3, 9 |
 | Merge | `ws merge` brings a branch or `<host>/<branch>` into a workspace's branch: up to date, fast-forward, a clean merge commit with both parents, or conflict markers to resolve, after which the commit records both parents. A refused push is followed by pull, merge, push | 2 |
 | Server | `peerfs serve` owns the space and serves it at `<space>/peerfs.sock`, so concurrent agents serialize through it; it exits after an idle timeout, on SIGTERM and on `peerfs stop` | 4 |
 | API | HTTP/1.1 and JSON over the Unix socket, following the host daemon's `admin.sock` conventions; a Rust client in `peerfs-api` | 4, 9 |
-| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `pull`, `push`, `remotes`, `key`, `hosts [add]`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / merge / discard` | 4 |
+| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `pull`, `push`, `remotes`, `key`, `hosts [add]`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / snapshot / snapshots / commit / merge / discard` | 4 |
 
 Not yet: signing through the host daemon, replication between hosts and durability receipts, owner rules for
 conflicts (`regenerate`, `ours`/`theirs`, structured merge), source/derived/secret path
@@ -58,6 +59,8 @@ the request names.
 | `GET /v1/workspaces/{name}/list?path=dir` | List a directory |
 | `GET /v1/workspaces/{name}/changes` | Uncommitted changes |
 | `POST /v1/workspaces/{name}/commit` | Commit (`{message, caller}`); the outcome is `committed`, `conflicted` or `unchanged` |
+| `POST /v1/workspaces/{name}/snapshot` | Snapshot the workspace (`{message?, caller}`); the outcome is `snapshot` or `unchanged` |
+| `GET /v1/workspaces/{name}/snapshots` | The current change's snapshots, newest first |
 | `POST /v1/objects/fetch` | Objects by id (`{ids}`, at most 256), as `application/octet-stream`; those not held are left out |
 | `POST /v1/pull` | Pull a branch from another server (`{from, branch}`, `from` its socket); the space is held only between fetches |
 | `GET /v1/remotes` | Tracking references, with when each was pulled |
@@ -93,7 +96,7 @@ peerfs ws read agent-2 notes.txt
 | `crates/peerfs` | The command-line interface, a client of the server |
 
 A space on disk is `FORMAT`, `HOST` (the host given at `init`), `signing.key` (mode 0600), `hosts`, `objects/pack-*.pack`, `refs/branches/<name>`, `refs/remotes/<host>/<branch>`, and
-`workspaces/<name>/` (`state`, `whiteouts`, `upper/`), and while a server runs,
+`workspaces/<name>/` (`state`, which names the base, change, latest snapshot and any merge, `whiteouts`, `upper/`), and while a server runs,
 `peerfs.sock`, `serve.pid` and its log `serve.log`.
 
 ## Checks

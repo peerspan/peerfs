@@ -387,3 +387,42 @@ fn the_home_host_refuses_commits_not_signed_by_their_hosts_key() {
     server.accept_objects(&objects).unwrap();
     assert!(server.have(&[signed])[0]);
 }
+
+#[test]
+fn a_push_sends_the_signed_commit_but_not_its_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut server, mut laptop) = pair(&dir);
+    let server_head = server.branch("main").unwrap();
+    let mut ws = laptop.workspace("w").unwrap();
+    let mut snapshots = Vec::new();
+    for step in 1..=3 {
+        ws.write(&laptop, "notes.txt", format!("step {step}\n").as_bytes())
+            .unwrap();
+        snapshots.extend(
+            laptop
+                .snapshot_workspace(&mut ws, "Write", &author("laptop"))
+                .unwrap(),
+        );
+    }
+    let CommitOutcome::Committed { commit: task, .. } = laptop
+        .commit_workspace(&mut ws, "Task", &author("laptop"))
+        .unwrap()
+    else {
+        panic!("expected a commit");
+    };
+    assert_eq!(
+        laptop.commit(task).unwrap().predecessor,
+        snapshots.last().copied()
+    );
+
+    let sent = send(&laptop, &mut server, task);
+    // The commit, the root tree and the final file; no snapshot, nor the earlier versions.
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert!(server.have(&snapshots).iter().all(|held| !held));
+    server.advance_branch("main", server_head, task).unwrap();
+    assert_eq!(
+        server.commit(task).unwrap().predecessor,
+        snapshots.last().copied(),
+        "the link travels, the snapshots do not"
+    );
+}

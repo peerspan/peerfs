@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use peerfs_api::{
     Caller, ChangeInfo, Client, CommitResponse, EntryKind, MergeResponse, Method, Revision,
+    SnapshotResponse,
 };
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
@@ -562,4 +563,63 @@ async fn commits_from_an_untrusted_host_are_forbidden_until_its_key_is_added() {
             .contains("not a known key of host laptop"),
         "{refused}"
     );
+}
+
+#[tokio::test]
+async fn snapshots_over_the_api_are_replaced_by_one_signed_commit() {
+    let running = start(None).await;
+    let client = &running.client;
+    client.create_workspace("w", "main").await.unwrap();
+    assert_eq!(
+        client.snapshot("w", None, &caller("a")).await.unwrap(),
+        SnapshotResponse::Unchanged
+    );
+    let mut taken = Vec::new();
+    for step in ["one", "two"] {
+        client
+            .write("w", "a.txt", format!("{step}\n"))
+            .await
+            .unwrap();
+        let SnapshotResponse::Snapshot { snapshot } = client
+            .snapshot("w", Some(&format!("Edit {step}")), &caller("a"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected a snapshot");
+        };
+        taken.push(snapshot);
+    }
+    let listed = client.snapshots("w").await.unwrap();
+    let ids: Vec<_> = listed.iter().map(|s| s.id.clone()).collect();
+    assert_eq!(ids, vec![taken[1].clone(), taken[0].clone()]);
+    assert_eq!(listed[0].message, "Edit two");
+    assert_eq!(listed[0].agent.as_deref(), Some("a"));
+    assert!(listed.iter().all(|s| s.signed_by.is_none()));
+    assert_eq!(
+        client.workspace("w").await.unwrap().snapshot,
+        Some(taken[1].clone())
+    );
+
+    let CommitResponse::Committed { commit, .. } =
+        client.commit("w", "Task", &caller("a")).await.unwrap()
+    else {
+        panic!("expected a commit");
+    };
+    let log = client.log("main", Some(1)).await.unwrap();
+    assert_eq!(log[0].id, commit);
+    assert_eq!(log[0].predecessor, Some(taken[1].clone()));
+    assert!(log[0].signed_by.is_some());
+    assert!(client.snapshots("w").await.unwrap().is_empty());
+    assert_eq!(client.workspace("w").await.unwrap().snapshot, None);
+
+    let unknown_field = client
+        .send(
+            Method::POST,
+            "/v1/workspaces/w/snapshot",
+            Some("application/json"),
+            r#"{"label":"x"}"#.into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_field.status, 400);
 }

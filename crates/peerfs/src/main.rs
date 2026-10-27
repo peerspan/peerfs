@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use peerfs_api::{
     Caller, ChangeInfo, Client, ClientError, CommitResponse, EntryKind, MergeResponse, Revision,
+    SnapshotResponse,
 };
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
@@ -169,7 +170,18 @@ enum WorkspaceCommand {
     },
     /// Show uncommitted changes.
     Status { name: String },
-    /// Commit the workspace's changes to its branch.
+    /// Snapshot the workspace for its current change, unsigned and kept on this host:
+    /// meant once per tool call. Prints the snapshot, or nothing when nothing changed.
+    Snapshot {
+        name: String,
+        /// What the snapshot follows, such as the tool call.
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// List the snapshots of the workspace's current change, newest first.
+    Snapshots { name: String },
+    /// Commit the workspace's changes to its branch as one signed commit, replacing the
+    /// change's snapshots.
     Commit {
         name: String,
         #[arg(short, long)]
@@ -424,9 +436,44 @@ async fn client_command(
                     commit.time_ms / 1000,
                     commit.message
                 )?;
+                if let Some(predecessor) = &commit.predecessor {
+                    writeln!(out, "  replaces snapshot {predecessor}")?;
+                }
             }
         }
         Command::Workspace(command) => return workspace(client, command, caller, out).await,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ws commit`: exits 1 on a conflict.
+async fn commit(
+    client: &Client,
+    name: &str,
+    message: &str,
+    caller: &Caller,
+    out: &mut impl Write,
+) -> Result<ExitCode> {
+    match client.commit(name, message, caller).await? {
+        CommitResponse::Committed { commit, merged } => {
+            let how = if merged {
+                " (merged onto the moved branch)"
+            } else {
+                ""
+            };
+            writeln!(out, "{commit}{how}")?;
+        }
+        CommitResponse::Unchanged => writeln!(out, "nothing to commit")?,
+        CommitResponse::Conflicted { conflicts } => {
+            for conflict in &conflicts {
+                writeln!(out, "conflict: {}: {}", conflict.path, conflict.kind)?;
+            }
+            writeln!(
+                out,
+                "nothing committed; resolve the conflicts in {name} and commit again"
+            )?;
+            return Ok(ExitCode::from(1));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -487,28 +534,26 @@ async fn workspace(
                 }
             }
         }
-        WorkspaceCommand::Commit { name, message } => {
-            match client.commit(&name, &message, caller).await? {
-                CommitResponse::Committed { commit, merged } => {
-                    let how = if merged {
-                        " (merged onto the moved branch)"
-                    } else {
-                        ""
-                    };
-                    writeln!(out, "{commit}{how}")?;
-                }
-                CommitResponse::Unchanged => writeln!(out, "nothing to commit")?,
-                CommitResponse::Conflicted { conflicts } => {
-                    for conflict in &conflicts {
-                        writeln!(out, "conflict: {}: {}", conflict.path, conflict.kind)?;
-                    }
-                    writeln!(
-                        out,
-                        "nothing committed; resolve the conflicts in {name} and commit again"
-                    )?;
-                    return Ok(ExitCode::from(1));
-                }
+        WorkspaceCommand::Snapshot { name, message } => {
+            if let SnapshotResponse::Snapshot { snapshot } =
+                client.snapshot(&name, message.as_deref(), caller).await?
+            {
+                writeln!(out, "{snapshot}")?;
             }
+        }
+        WorkspaceCommand::Snapshots { name } => {
+            for snapshot in client.snapshots(&name).await? {
+                writeln!(
+                    out,
+                    "{} at {} {}",
+                    snapshot.id,
+                    snapshot.time_ms / 1000,
+                    snapshot.message
+                )?;
+            }
+        }
+        WorkspaceCommand::Commit { name, message } => {
+            return commit(client, &name, &message, caller, out).await;
         }
         WorkspaceCommand::Merge { name, revision } => {
             match client.merge(&name, &revision, caller).await? {

@@ -144,6 +144,7 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: "Create the space".to_owned(),
+            predecessor: None,
             signature: None,
         })?;
         space.create_branch(DEFAULT_BRANCH, commit)?;
@@ -523,10 +524,11 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: format!("Merge {revision}"),
+            predecessor: None,
             signature: None,
         })?;
         self.update_branch(&branch, Some(head), commit)?;
-        workspace.reset(commit)?;
+        workspace.finish_change(commit)?;
         Ok(MergeOutcome::Merged { commit })
     }
 
@@ -787,6 +789,7 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: message.to_owned(),
+            predecessor: None,
             signature: None,
         })?;
         self.update_branch(branch, Some(head), commit)?;
@@ -962,15 +965,78 @@ impl Space {
         fs::remove_dir_all(&dir).map_err(|e| Error::io("removing", dir, e))
     }
 
-    /// Commits a workspace's changes to its branch.
+    /// Takes an unsigned snapshot of the workspace, for the current change: a commit of its
+    /// tree whose parent is the change's previous snapshot, or the workspace's base. The
+    /// branch and the overlay are untouched, and the snapshot stays on this host. Returns
+    /// `None` when nothing changed since the previous snapshot, or since the base.
     ///
-    /// If the branch moved since the workspace's base, the changes are merged onto the new
-    /// head. A conflict commits nothing: the workspace moves to the new head with the
-    /// merge in place, markers included, for the caller to resolve and commit again.
+    /// Meant to be called once per agent tool call; committing the workspace then replaces
+    /// the change's snapshots with one signed commit.
     ///
     /// # Errors
     ///
-    /// Fails if the branch is gone, an object is missing, or on a file system error.
+    /// Fails on a store or file system error.
+    pub fn snapshot_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        message: &str,
+        author: &Author,
+    ) -> Result<Option<ObjectId>> {
+        let base_tree = self.commit(workspace.base())?.tree;
+        let tree = workspace.apply(self, base_tree)?;
+        let previous = workspace.snapshot();
+        let previous_tree = match previous {
+            Some(snapshot) => self.commit(snapshot)?.tree,
+            None => base_tree,
+        };
+        if tree == previous_tree {
+            return Ok(None);
+        }
+        let snapshot = Commit {
+            tree,
+            parents: vec![previous.unwrap_or(workspace.base())],
+            change: workspace.change(),
+            author: author.clone(),
+            time: SystemTime::now(),
+            message: message.to_owned(),
+            predecessor: None,
+            signature: None,
+        };
+        let id = self.store.put(Kind::Commit, &snapshot.encode())?;
+        // The workspace's state names the snapshot only once the snapshot is durable.
+        self.store.sync()?;
+        workspace.set_snapshot(id)?;
+        Ok(Some(id))
+    }
+
+    /// The current change's snapshots, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a snapshot is missing or corrupt.
+    pub fn snapshots(&self, workspace: &Workspace) -> Result<Vec<(ObjectId, Commit)>> {
+        let mut snapshots = Vec::new();
+        let mut next = workspace.snapshot();
+        while let Some(id) = next {
+            let commit = self.commit(id)?;
+            if commit.signature.is_some() || commit.change != workspace.change() {
+                break;
+            }
+            next = commit.parents.first().copied();
+            snapshots.push((id, commit));
+        }
+        Ok(snapshots)
+    }
+
+    /// Commits the workspace's changes to its branch as one signed commit, ending the
+    /// change. When the change has snapshots, a last one is taken and the commit names it
+    /// as its predecessor. When the branch has moved, the changes are merged onto its head
+    /// first; on a conflict nothing is committed, the change and its snapshots continue,
+    /// and the workspace holds the merge to resolve.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the branch is gone, or on a store or file system error.
     pub fn commit_workspace(
         &mut self,
         workspace: &mut Workspace,
@@ -990,6 +1056,9 @@ impl Space {
                 workspace.reset(head)?;
             }
             return Ok(CommitOutcome::Unchanged);
+        }
+        if workspace.snapshot().is_some() {
+            self.snapshot_workspace(workspace, message, author)?;
         }
         let (tree, merged) = if head == base_commit {
             (ours, Merged::No)
@@ -1012,10 +1081,11 @@ impl Space {
             author: author.clone(),
             time: SystemTime::now(),
             message: message.to_owned(),
+            predecessor: workspace.snapshot(),
             signature: None,
         })?;
         self.update_branch(&branch, Some(head), commit)?;
-        workspace.reset(commit)?;
+        workspace.finish_change(commit)?;
         Ok(CommitOutcome::Committed { commit, merged })
     }
 

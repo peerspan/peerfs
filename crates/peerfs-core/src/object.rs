@@ -398,11 +398,15 @@ pub struct Commit {
     pub time: SystemTime,
     /// Free text describing it.
     pub message: String,
+    /// The local snapshot this commit replaces, the last of its change's unsigned
+    /// snapshots. A weak link: it is not a reference, so holding or sending the commit
+    /// needs none of the snapshots, which stay on the host that took them.
+    pub predecessor: Option<ObjectId>,
     /// The authoring host's signature, which the space adds when it stores the commit.
     pub signature: Option<Signature>,
 }
 
-const COMMIT_FORMAT: u8 = 2;
+const COMMIT_FORMAT: u8 = 3;
 
 /// The signature algorithm code: Ed25519, the only one.
 const ED25519: u8 = 1;
@@ -471,6 +475,13 @@ impl Commit {
         encode_optional(&mut out, self.author.session.as_deref());
         out.u64(u64::try_from(millis).unwrap_or(u64::MAX));
         out.str(&self.message);
+        match &self.predecessor {
+            None => out.u8(0),
+            Some(predecessor) => {
+                out.u8(1);
+                out.id(predecessor);
+            }
+        }
         out
     }
 
@@ -500,6 +511,16 @@ impl Commit {
         };
         let time = UNIX_EPOCH + Duration::from_millis(input.u64()?);
         let message = input.string()?;
+        let predecessor = match input.u8()? {
+            0 => None,
+            1 => Some(input.id()?),
+            tag => {
+                return Err(DecodeError::Tag {
+                    what: "predecessor",
+                    tag,
+                });
+            }
+        };
         let signature = match input.u8()? {
             0 => None,
             ED25519 => {
@@ -527,6 +548,7 @@ impl Commit {
             author,
             time,
             message,
+            predecessor,
             signature,
         })
     }
@@ -576,6 +598,7 @@ mod tests {
             },
             time: UNIX_EPOCH + Duration::from_millis(1_793_000_000_123),
             message: "edit".to_owned(),
+            predecessor: Some(ObjectId::compute(Kind::Commit, b"snapshot")),
             signature: None,
         };
         assert_eq!(Commit::decode(&commit.encode()), Ok(commit.clone()));

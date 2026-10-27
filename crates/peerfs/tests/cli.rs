@@ -261,3 +261,37 @@ fn a_pull_needs_the_other_spaces_key_which_key_prints_for_hosts_add() {
     assert!(log.contains("Create the space"), "{log}");
     assert!(!log.contains("unsigned"), "{log}");
 }
+
+#[test]
+fn ws_snapshot_prints_each_snapshot_and_commit_replaces_them() {
+    let space = new_space();
+    let run = |args: &[&str], stdin: Option<&str>| ok(&peerfs(&space.path, "a", args, stdin));
+    run(&["ws", "create", "w"], None);
+    assert_eq!(
+        run(&["ws", "snapshot", "w"], None),
+        "",
+        "nothing to snapshot"
+    );
+    run(&["ws", "write", "w", "a.txt"], Some("one\n"));
+    let first = run(&["ws", "snapshot", "w", "-m", "Write a.txt"], None);
+    assert_eq!(first.trim().len(), 66, "{first}");
+    assert_eq!(run(&["ws", "snapshot", "w"], None), "", "unchanged");
+    run(&["ws", "write", "w", "a.txt"], Some("two\n"));
+    let second = run(&["ws", "snapshot", "w"], None);
+
+    let listed = run(&["ws", "snapshots", "w"], None);
+    let ids: Vec<&str> = listed
+        .lines()
+        .filter_map(|line| line.split(' ').next())
+        .collect();
+    assert_eq!(ids, vec![second.trim(), first.trim()]);
+    assert!(listed.contains("Write a.txt"), "{listed}");
+
+    run(&["ws", "commit", "w", "-m", "Task"], None);
+    let log = run(&["log", "-n", "1"], None);
+    assert!(
+        log.contains(&format!("replaces snapshot {}", second.trim())),
+        "{log}"
+    );
+    assert_eq!(run(&["ws", "snapshots", "w"], None), "");
+}

@@ -97,6 +97,10 @@ pub struct CommitInfo {
     pub time_ms: u64,
     /// Its message.
     pub message: String,
+    /// The local snapshot it replaces, if its change had snapshots. Only the host that
+    /// took it holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<String>,
     /// The key that signed it, in standard Base64; absent for an unsigned commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
@@ -147,6 +151,9 @@ pub struct WorkspaceInfo {
     pub branch: String,
     /// The commit its changes are relative to.
     pub base: String,
+    /// The latest snapshot of its current change, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
 /// `POST /v1/workspaces`: create a workspace following a branch.
@@ -206,6 +213,32 @@ pub struct CommitRequest {
     /// Who is committing.
     #[serde(default)]
     pub caller: Caller,
+}
+
+/// `POST /v1/workspaces/{name}/snapshot`: an unsigned snapshot of the workspace for its
+/// current change, kept on this host until a commit replaces it. One per tool call.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotRequest {
+    /// What the snapshot follows, such as the tool call; `Snapshot` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Who is snapshotting.
+    #[serde(default)]
+    pub caller: Caller,
+}
+
+/// The result of `POST /v1/workspaces/{name}/snapshot`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "lowercase", deny_unknown_fields)]
+pub enum SnapshotResponse {
+    /// A snapshot was taken.
+    Snapshot {
+        /// The snapshot.
+        snapshot: String,
+    },
+    /// Nothing changed since the last snapshot, or since the workspace's base.
+    Unchanged,
 }
 
 /// A path both sides changed in ways the merge could not combine.

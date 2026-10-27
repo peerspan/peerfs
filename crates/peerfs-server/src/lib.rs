@@ -25,11 +25,12 @@ use peerfs_api::{
     CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
     ExportRequest, FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest,
     MergeRequest, MergeResponse, PullRequest, PullResponse, PushRequest, PushResponse,
-    ReceiveResponse, Revision, SOCKET_NAME, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    ReceiveResponse, Revision, SOCKET_NAME, SnapshotRequest, SnapshotResponse, SpaceInfo,
+    TrackingInfo, WorkspaceInfo,
 };
 use peerfs_core::{
-    Author, Change, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH, MergeOutcome,
-    Merged, ObjectId, PublicKey, Space, Workspace, decode_objects, encode_objects,
+    Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH,
+    MergeOutcome, Merged, ObjectId, PublicKey, Space, Workspace, decode_objects, encode_objects,
 };
 use serde::Deserialize;
 use tokio::net::UnixListener;
@@ -107,6 +108,8 @@ fn router_with(state: AppState) -> Router {
         .route("/v1/workspaces/{name}/list", get(list))
         .route("/v1/workspaces/{name}/changes", get(changes))
         .route("/v1/workspaces/{name}/commit", post(commit))
+        .route("/v1/workspaces/{name}/snapshot", post(snapshot))
+        .route("/v1/workspaces/{name}/snapshots", get(snapshots))
         .route("/v1/objects/fetch", post(fetch_objects))
         .route("/v1/objects/have", post(have_objects))
         .route(
@@ -360,6 +363,27 @@ fn workspace_info(workspace: &Workspace) -> WorkspaceInfo {
         name: workspace.name().to_owned(),
         branch: workspace.branch().to_owned(),
         base: workspace.base().to_string(),
+        snapshot: workspace.snapshot().map(|snapshot| snapshot.to_string()),
+    }
+}
+
+fn commit_info(id: ObjectId, commit: Commit) -> CommitInfo {
+    CommitInfo {
+        id: id.to_string(),
+        tree: commit.tree.to_string(),
+        parents: commit.parents.iter().map(ToString::to_string).collect(),
+        change: commit.change.to_string(),
+        host: commit.author.host,
+        agent: commit.author.agent,
+        session: commit.author.session,
+        time_ms: commit.time.duration_since(UNIX_EPOCH).map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        }),
+        message: commit.message,
+        predecessor: commit
+            .predecessor
+            .map(|predecessor| predecessor.to_string()),
+        signed_by: commit.signature.map(|signature| signature.key.to_string()),
     }
 }
 
@@ -451,20 +475,7 @@ async fn log(
         let commits = history
             .into_iter()
             .take(query.limit.unwrap_or(usize::MAX))
-            .map(|(id, commit)| CommitInfo {
-                id: id.to_string(),
-                tree: commit.tree.to_string(),
-                parents: commit.parents.iter().map(ToString::to_string).collect(),
-                change: commit.change.to_string(),
-                host: commit.author.host,
-                agent: commit.author.agent,
-                session: commit.author.session,
-                time_ms: commit.time.duration_since(UNIX_EPOCH).map_or(0, |since| {
-                    u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
-                }),
-                message: commit.message,
-                signed_by: commit.signature.map(|signature| signature.key.to_string()),
-            })
+            .map(|(id, commit)| commit_info(id, commit))
             .collect();
         Ok(Json(commits))
     })
@@ -687,6 +698,45 @@ async fn commit(
             other => return Err(ApiError::internal(&format!("{other:?}"))),
         };
         Ok(Json(response))
+    })
+    .await
+}
+
+async fn snapshot(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    body: Result<Json<SnapshotRequest>, JsonRejection>,
+) -> ApiResult<Json<SnapshotResponse>> {
+    let Json(request) = body?;
+    with_space(&state, move |space, host| {
+        let mut workspace = space.workspace(&name)?;
+        let message = request.message.as_deref().unwrap_or("Snapshot");
+        let author = author(host, request.caller);
+        Ok(Json(
+            match space.snapshot_workspace(&mut workspace, message, &author)? {
+                Some(snapshot) => SnapshotResponse::Snapshot {
+                    snapshot: snapshot.to_string(),
+                },
+                None => SnapshotResponse::Unchanged,
+            },
+        ))
+    })
+    .await
+}
+
+async fn snapshots(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> ApiResult<Json<Vec<CommitInfo>>> {
+    with_space(&state, move |space, _| {
+        let workspace = space.workspace(&name)?;
+        Ok(Json(
+            space
+                .snapshots(&workspace)?
+                .into_iter()
+                .map(|(id, commit)| commit_info(id, commit))
+                .collect(),
+        ))
     })
     .await
 }

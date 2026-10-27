@@ -55,6 +55,7 @@ pub struct Workspace {
     branch: Name,
     base: ObjectId,
     change: ChangeId,
+    snapshot: Option<ObjectId>,
     merging: Option<ObjectId>,
     whiteouts: BTreeSet<TreePath>,
 }
@@ -72,6 +73,7 @@ impl Workspace {
             branch,
             base,
             change: ChangeId::random(),
+            snapshot: None,
             merging: None,
             whiteouts: BTreeSet::new(),
         };
@@ -105,6 +107,10 @@ impl Workspace {
             .get("change")
             .and_then(|text| ChangeId::from_hex(text))
             .ok_or_else(|| corrupt("change"))?;
+        let snapshot = match fields.get("snapshot") {
+            Some(text) => Some(text.parse().map_err(|_| corrupt("snapshot"))?),
+            None => None,
+        };
         let merging = match fields.get("merge") {
             Some(text) => Some(text.parse().map_err(|_| corrupt("merge"))?),
             None => None,
@@ -124,6 +130,7 @@ impl Workspace {
             branch,
             base,
             change,
+            snapshot,
             merging,
             whiteouts,
         })
@@ -147,6 +154,24 @@ impl Workspace {
     /// The change its commits belong to.
     pub fn change(&self) -> ChangeId {
         self.change
+    }
+
+    /// The latest snapshot of the current change, if one was taken since the last commit.
+    pub fn snapshot(&self) -> Option<ObjectId> {
+        self.snapshot
+    }
+
+    pub(crate) fn set_snapshot(&mut self, snapshot: ObjectId) -> Result<()> {
+        self.snapshot = Some(snapshot);
+        self.save()
+    }
+
+    /// Ends the current change: follows `commit` with an empty overlay and starts a new
+    /// change with no snapshots.
+    pub(crate) fn finish_change(&mut self, commit: ObjectId) -> Result<()> {
+        self.change = ChangeId::random();
+        self.snapshot = None;
+        self.reset(commit)
     }
 
     /// The commit being merged in, when a merge stopped on conflicts. Committing the
@@ -173,12 +198,16 @@ impl Workspace {
     }
 
     fn save(&self) -> Result<()> {
+        let snapshot = self
+            .snapshot
+            .map(|snapshot| format!("snapshot {snapshot}\n"))
+            .unwrap_or_default();
         let merge = self
             .merging
             .map(|merging| format!("merge {merging}\n"))
             .unwrap_or_default();
         let state = format!(
-            "branch {}\nbase {}\nchange {}\n{merge}",
+            "branch {}\nbase {}\nchange {}\n{snapshot}{merge}",
             self.branch, self.base, self.change
         );
         write_synced(&self.dir, "state", state.as_bytes())?;

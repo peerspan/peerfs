@@ -16,8 +16,8 @@ use crate::wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
     HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, PullRequest,
-    PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision, SpaceInfo, TrackingInfo,
-    WorkspaceInfo,
+    PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision, SnapshotRequest,
+    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -590,5 +590,35 @@ impl Client {
             caller: caller.clone(),
         };
         self.json(Method::POST, &path, Some(&request)).await
+    }
+
+    /// Takes an unsigned snapshot of a workspace for its current change. `message` says
+    /// what it follows, such as the tool call.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `not_found` if there is no such workspace.
+    pub async fn snapshot(
+        &self,
+        workspace: &str,
+        message: Option<&str>,
+        caller: &Caller,
+    ) -> Result<SnapshotResponse, ClientError> {
+        let path = format!("/v1/workspaces/{}/snapshot", segment(workspace));
+        let request = SnapshotRequest {
+            message: message.map(ToOwned::to_owned),
+            caller: caller.clone(),
+        };
+        self.json(Method::POST, &path, Some(&request)).await
+    }
+
+    /// The snapshots of a workspace's current change, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `not_found` if there is no such workspace.
+    pub async fn snapshots(&self, workspace: &str) -> Result<Vec<CommitInfo>, ClientError> {
+        let path = format!("/v1/workspaces/{}/snapshots", segment(workspace));
+        self.json(Method::GET, &path, None::<&()>).await
     }
 }

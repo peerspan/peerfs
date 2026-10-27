@@ -16,7 +16,7 @@ pub use wire::{
     ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest,
     FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest,
     MergeResponse, PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision,
-    SpaceInfo, TrackingInfo, WorkspaceInfo,
+    SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 
 /// The socket's file name inside the space directory.
