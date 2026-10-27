@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use peerfs_api::{
-    Caller, ChangeInfo, Client, ClientError, CommitResponse, EntryKind, GcRequest, GcResponse,
-    MergeResponse, Revision, SnapshotResponse,
+    Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitResponse, EntryKind, GcRequest,
+    GcResponse, MergeResponse, Revision, SnapshotResponse,
 };
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
@@ -475,10 +475,7 @@ async fn client_command(
         }
         Command::Log { branch, limit } => {
             for commit in client.log(&branch, limit).await? {
-                let who = match &commit.agent {
-                    Some(agent) => format!("{agent}@{}", commit.host),
-                    None => commit.host.clone(),
-                };
+                let who = author(&commit);
                 let unsigned = if commit.signed_by.is_none() {
                     ", unsigned"
                 } else {
@@ -534,14 +531,27 @@ fn print_gc(report: &GcResponse, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// `ws snapshots`: one line per snapshot, newest first.
+/// Who made a commit: `agent@host`, or the host alone, and the session when known.
+fn author(commit: &CommitInfo) -> String {
+    let mut who = match &commit.agent {
+        Some(agent) => format!("{agent}@{}", commit.host),
+        None => commit.host.clone(),
+    };
+    if let Some(session) = &commit.session {
+        who = format!("{who} in session {session}");
+    }
+    who
+}
+
+/// `ws snapshots`: one line per snapshot, newest first, with who took it.
 async fn print_snapshots(client: &Client, name: &str, out: &mut impl Write) -> Result<()> {
     for snapshot in client.snapshots(name).await? {
         writeln!(
             out,
-            "{} at {} {}",
+            "{} at {} by {}: {}",
             snapshot.id,
             snapshot.time_ms / 1000,
+            author(&snapshot),
             snapshot.message
         )?;
     }

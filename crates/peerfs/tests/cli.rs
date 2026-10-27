@@ -285,7 +285,7 @@ fn ws_snapshot_prints_each_snapshot_and_commit_replaces_them() {
         .filter_map(|line| line.split(' ').next())
         .collect();
     assert_eq!(ids, vec![second.trim(), first.trim()]);
-    assert!(listed.contains("Write a.txt"), "{listed}");
+    assert!(listed.contains(" by a@test-host: Write a.txt"), "{listed}");
 
     run(&["ws", "commit", "w", "-m", "Task"], None);
     let log = run(&["log", "-n", "1"], None);
@@ -381,7 +381,7 @@ fn the_claude_code_hook_snapshots_a_mounted_workspace_after_a_tool_call() {
     let snapshots = run(&["ws", "snapshots", "w"]);
     assert_eq!(snapshots.lines().count(), 1, "{snapshots}");
     assert!(
-        snapshots.contains("Write: notes.txt (toolu_1)"),
+        snapshots.contains(" by a@test-host in session s1: Write: notes.txt (toolu_1)"),
         "{snapshots}"
     );
 

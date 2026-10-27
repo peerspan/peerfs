@@ -118,8 +118,8 @@ Run Claude Code in a mounted workspace and add the hook to its settings
 ```
 
 After each tool call it snapshots the workspace when anything changed, with a message such
-as `Bash: cargo test (toolu_01...)`; `peerfs ws snapshots NAME` lists them and `ws commit`
-coalesces them into one signed commit. The agent recorded is `PEERFS_AGENT`, or
+as `Bash: cargo test (toolu_01...)`; `peerfs ws snapshots NAME` lists them, each with the agent,
+host and session that took it, and `ws commit` coalesces them into one signed commit. The agent recorded is `PEERFS_AGENT`, or
 `claude-code`; the session is `PEERFS_SESSION`, or Claude Code's session ID. A snapshot of
 this repository mounted with a 1.2 GB `target/` takes 15-40 ms, and a call that changed
 nothing about 12 ms. Errors exit 1, which Claude Code shows without stopping the agent.
