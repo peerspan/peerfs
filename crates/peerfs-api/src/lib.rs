@@ -14,10 +14,10 @@ pub use hyper::Method;
 pub use wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest,
-    FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest,
-    MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
-    ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SnapshotRequest, SnapshotResponse,
-    SpaceInfo, TrackingInfo, WorkspaceInfo,
+    FetchRequest, ForkRequest, GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey,
+    ImportRequest, MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest,
+    PushResponse, ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SnapshotRequest,
+    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 
 /// The socket's file name inside the space directory.

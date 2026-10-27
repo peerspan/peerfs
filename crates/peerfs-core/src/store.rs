@@ -4,12 +4,17 @@
 //! the codec code, the 33-byte object id, then the payload. Records are only appended. A
 //! crash can leave a partial record at the end of the newest pack; opening the store cuts
 //! it off. Every read is checked against the object's identity.
+//!
+//! [`Store::compact`] drops objects by rewriting packs: it copies the records it keeps into
+//! new packs, syncs them, and only then deletes the old ones, so a crash leaves at worst an
+//! object in two packs, which opening the store tolerates.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::codec::len_u64;
 use crate::error::{Error, Result};
@@ -282,6 +287,209 @@ impl Store {
     }
 }
 
+/// Whether compacting drops objects or only reports what it would drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sweep {
+    Report,
+    Apply,
+}
+
+/// What compacting the store dropped, or would drop.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Compacted {
+    /// Objects no longer held.
+    pub(crate) dropped: HashSet<ObjectId>,
+    /// Bytes of pack records removed, duplicates included.
+    pub(crate) bytes: u64,
+    /// Objects not kept but left for now, being in packs written since the cutoff.
+    pub(crate) waiting: HashSet<ObjectId>,
+    /// Packs rewritten.
+    pub(crate) packs: usize,
+}
+
+/// One record of a pack, as its header describes it.
+#[derive(Debug, Clone, Copy)]
+struct Record {
+    id: ObjectId,
+    /// Where the record starts, header included.
+    start: u64,
+    /// The record's length, header included.
+    len: u64,
+}
+
+impl Store {
+    /// Every object held, with its kind.
+    pub(crate) fn objects(&self) -> impl Iterator<Item = (ObjectId, Kind)> + '_ {
+        self.index.iter().map(|(id, location)| (*id, location.kind))
+    }
+
+    /// Drops every object not in `live` from the packs last written before `cutoff`, and
+    /// the extra copies of objects held twice there. Newer packs are left alone, so objects
+    /// written since, such as those of a pull that has not yet moved a reference, survive.
+    /// [`Sweep::Report`] reports what would be dropped and changes nothing.
+    pub(crate) fn compact(
+        &mut self,
+        live: &HashSet<ObjectId>,
+        cutoff: SystemTime,
+        sweep: Sweep,
+    ) -> Result<Compacted> {
+        self.sync()?;
+        self.open = None;
+        let mut compacted = Compacted::default();
+        let mut old = HashSet::new();
+        for &sequence in &self.packs {
+            let path = self.dir.join(pack_name(sequence));
+            let modified = fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map_err(|e| Error::io("reading", &path, e))?;
+            if modified <= cutoff {
+                old.insert(sequence);
+            }
+        }
+        for (id, location) in &self.index {
+            if !live.contains(id) && !old.contains(&location.pack) {
+                compacted.waiting.insert(*id);
+            }
+        }
+        // Which old packs hold records to drop, and the records each keeps.
+        let mut rewrites = Vec::new();
+        for &sequence in self.packs.iter().filter(|sequence| old.contains(sequence)) {
+            let mut kept = Vec::new();
+            let mut freed = 0;
+            for record in records(&self.dir, sequence)? {
+                let indexed_here = self.index.get(&record.id).is_some_and(|location| {
+                    location.pack == sequence
+                        && location.offset == record.start + len_u64(HEADER_LEN)
+                });
+                if indexed_here && live.contains(&record.id) {
+                    kept.push(record);
+                } else {
+                    freed += record.len;
+                    if indexed_here {
+                        compacted.dropped.insert(record.id);
+                    }
+                }
+            }
+            if freed > 0 {
+                compacted.bytes += freed;
+                rewrites.push((sequence, kept));
+            }
+        }
+        compacted.packs = rewrites.len();
+        if sweep == Sweep::Report || rewrites.is_empty() {
+            return Ok(compacted);
+        }
+
+        // Copy what is kept into new packs, each synced before the next is started.
+        let mut moved = Vec::new();
+        let mut output: Option<OpenPack> = None;
+        let mut buffer = Vec::new();
+        for (sequence, kept) in &rewrites {
+            let path = self.dir.join(pack_name(*sequence));
+            let source = File::open(&path).map_err(|e| Error::io("opening", &path, e))?;
+            for record in kept {
+                buffer.resize(to_usize(record.len), 0);
+                source
+                    .read_exact_at(&mut buffer, record.start)
+                    .map_err(|e| Error::io("reading", &path, e))?;
+                if output
+                    .as_ref()
+                    .is_some_and(|pack| pack.len > 0 && pack.len + record.len > PACK_TARGET)
+                {
+                    self.finish_output(output.take())?;
+                }
+                if output.is_none() {
+                    output = Some(self.start_output()?);
+                }
+                let pack = output.as_mut().expect("an output pack is open");
+                pack.file.write_all(&buffer).map_err(|e| {
+                    Error::io("appending to", self.dir.join(pack_name(pack.sequence)), e)
+                })?;
+                moved.push((record.id, pack.sequence, pack.len + len_u64(HEADER_LEN)));
+                pack.len += record.len;
+            }
+        }
+        self.finish_output(output)?;
+        sync_dir(&self.dir)?;
+
+        for (id, pack, offset) in moved {
+            if let Some(location) = self.index.get_mut(&id) {
+                location.pack = pack;
+                location.offset = offset;
+            }
+        }
+        for id in &compacted.dropped {
+            self.index.remove(id);
+        }
+        for (sequence, _) in &rewrites {
+            let path = self.dir.join(pack_name(*sequence));
+            fs::remove_file(&path).map_err(|e| Error::io("removing", &path, e))?;
+            self.packs.retain(|pack| pack != sequence);
+        }
+        sync_dir(&self.dir)?;
+        Ok(compacted)
+    }
+
+    /// Creates the next pack for compaction's output.
+    fn start_output(&mut self) -> Result<OpenPack> {
+        let sequence = self.packs.last().map_or(0, |last| last + 1);
+        let path = self.dir.join(pack_name(sequence));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| Error::io("creating", &path, e))?;
+        self.packs.push(sequence);
+        Ok(OpenPack {
+            sequence,
+            file,
+            len: 0,
+            dirty: true,
+        })
+    }
+
+    /// Syncs a pack of compaction's output, so a later pack's crash cannot tear it.
+    fn finish_output(&self, pack: Option<OpenPack>) -> Result<()> {
+        if let Some(pack) = pack {
+            pack.file
+                .sync_data()
+                .map_err(|e| Error::io("syncing", self.dir.join(pack_name(pack.sequence)), e))?;
+        }
+        Ok(())
+    }
+}
+
+/// The records of a sealed pack, from their headers.
+fn records(dir: &Path, sequence: u32) -> Result<Vec<Record>> {
+    let path = dir.join(pack_name(sequence));
+    let file = File::open(&path).map_err(|e| Error::io("opening", &path, e))?;
+    let len = file
+        .metadata()
+        .map_err(|e| Error::io("reading", &path, e))?
+        .len();
+    let mut records = Vec::new();
+    let mut header = [0; HEADER_LEN];
+    let mut start = 0;
+    while start + len_u64(HEADER_LEN) <= len {
+        file.read_exact_at(&mut header, start)
+            .map_err(|e| Error::io("reading", &path, e))?;
+        let payload = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let id = ObjectId::from_bytes(&header[6..])
+            .map_err(|e| Error::Corrupt(format!("{} at {start}: {e}", path.display())))?;
+        let record_len = len_u64(HEADER_LEN) + u64::from(payload);
+        if start + record_len > len {
+            break;
+        }
+        records.push(Record {
+            id,
+            start,
+            len: record_len,
+        });
+        start += record_len;
+    }
+    Ok(records)
+}
+
 /// Whether a pack may end in a partial record from a crash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tail {
@@ -393,6 +601,42 @@ mod tests {
             store.get(&b).expect("read").map(|(_, bytes)| bytes.len()),
             Some(10_000)
         );
+    }
+
+    #[test]
+    fn compaction_drops_the_dead_and_a_crash_midway_loses_nothing() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut store = Store::open(dir.path()).expect("open");
+        let kept = store.put(Kind::Blob, b"kept").expect("put");
+        let dead = store.put(Kind::Blob, &[9; 5_000]).expect("put");
+        store.sync().expect("sync");
+        let old_pack = dir.path().join(pack_name(0));
+        let saved = fs::read(&old_pack).expect("pack");
+        let live = HashSet::from([kept]);
+        let later = SystemTime::now() + std::time::Duration::from_secs(60);
+
+        let report = store.compact(&live, later, Sweep::Report).expect("dry run");
+        assert_eq!(report.dropped, HashSet::from([dead]));
+        assert!(old_pack.exists(), "a dry run changes nothing");
+
+        let report = store.compact(&live, later, Sweep::Apply).expect("compact");
+        assert_eq!((report.dropped.len(), report.packs), (1, 1));
+        assert!(!old_pack.exists());
+        assert_eq!(store.get(&dead).expect("read"), None);
+        assert_eq!(
+            store.get(&kept).expect("read"),
+            Some((Kind::Blob, b"kept".to_vec()))
+        );
+        let after = store.put(Kind::Blob, b"after").expect("put");
+        store.sync().expect("sync");
+
+        // As if the crash came after the new pack was written but before the old one was
+        // removed: both hold the kept object.
+        fs::write(&old_pack, saved).expect("restore old pack");
+        let store = Store::open(dir.path()).expect("reopen");
+        for id in [kept, dead, after] {
+            assert!(store.get(&id).expect("read").is_some());
+        }
     }
 
     #[test]

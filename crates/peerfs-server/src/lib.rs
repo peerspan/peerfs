@@ -24,13 +24,13 @@ use axum::routing::{get, post};
 use peerfs_api::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest,
     CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
-    ExportRequest, FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest,
-    MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
-    ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SOCKET_NAME, SnapshotRequest,
-    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    ExportRequest, FetchRequest, ForkRequest, GcRequest, GcResponse, HaveRequest, HaveResponse,
+    HostKey, ImportRequest, MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse,
+    PushRequest, PushResponse, ReceiveResponse, RestoreRequest, RestoreResponse, Revision,
+    SOCKET_NAME, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 use peerfs_core::{
-    Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH,
+    Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH, GcOptions,
     MergeOutcome, Merged, ObjectId, PublicKey, Space, Workspace, decode_objects, encode_objects,
 };
 use peerfs_mount::Mount;
@@ -133,6 +133,7 @@ fn router_with(state: AppState) -> Router {
             post(mount_workspace).delete(unmount_workspace),
         )
         .route("/v1/mounts", get(mounts))
+        .route("/v1/gc", post(gc))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
@@ -788,6 +789,31 @@ async fn restore(
             target: restored.target.to_string(),
             before: restored.before.map(|id| id.to_string()),
             snapshot: restored.snapshot.map(|id| id.to_string()),
+        }))
+    })
+    .await
+}
+
+async fn gc(
+    State(state): State<AppState>,
+    body: Result<Json<GcRequest>, JsonRejection>,
+) -> ApiResult<Json<GcResponse>> {
+    let Json(request) = body?;
+    with_space(&state, move |space, _| {
+        let options = GcOptions {
+            dry_run: request.dry_run,
+            ..GcOptions::default()
+        };
+        let report = space.collect_garbage(&options)?;
+        Ok(Json(GcResponse {
+            dry_run: request.dry_run,
+            objects_kept: report.objects_kept,
+            objects_dropped: report.objects_dropped,
+            objects_waiting: report.objects_waiting,
+            bytes_freed: report.bytes_freed,
+            packs_rewritten: report.packs_rewritten,
+            snapshots_kept: report.snapshots_kept,
+            snapshots_dropped: report.snapshots_dropped,
         }))
     })
     .await

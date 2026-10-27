@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use peerfs_api::{
-    Caller, ChangeInfo, Client, ClientError, CommitResponse, EntryKind, MergeResponse, Revision,
-    SnapshotResponse,
+    Caller, ChangeInfo, Client, ClientError, CommitResponse, EntryKind, GcRequest, GcResponse,
+    MergeResponse, Revision, SnapshotResponse,
 };
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
@@ -97,6 +97,14 @@ enum Command {
     Remotes,
     /// List mounted workspaces and where they are mounted.
     Mounts,
+    /// Drop what the space no longer needs: snapshots past their retention (a committed
+    /// change's after 90 days, any after 30) and objects nothing reaches. Packs written in
+    /// the last day are left alone.
+    Gc {
+        /// Report what would be dropped, and drop nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print the host and the key this space signs its commits with, as `<host> <key>`:
     /// what another space gives `hosts add` to accept them.
     Key,
@@ -445,6 +453,7 @@ async fn client_command(
                 writeln!(out, "{} {}", mount.workspace, mount.path)?;
             }
         }
+        Command::Gc { dry_run } => print_gc(&client.gc(&GcRequest { dry_run }).await?, out)?,
         Command::Key => {
             let space = client.space().await?;
             let key = space.key.context("this space does not sign its commits")?;
@@ -490,6 +499,39 @@ async fn client_command(
         Command::Workspace(command) => return workspace(client, command, caller, out).await,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// `gc`: what was dropped, or would be, and what was kept.
+fn print_gc(report: &GcResponse, out: &mut impl Write) -> Result<()> {
+    let verb = if report.dry_run {
+        "would drop"
+    } else {
+        "dropped"
+    };
+    let (whole, tenths) = (
+        report.bytes_freed / MIB,
+        report.bytes_freed % MIB * 10 / MIB,
+    );
+    writeln!(
+        out,
+        "{verb} {} snapshots and {} objects, {whole}.{tenths} MiB from {} packs",
+        report.snapshots_dropped, report.objects_dropped, report.packs_rewritten
+    )?;
+    writeln!(
+        out,
+        "kept {} snapshots and {} objects",
+        report.snapshots_kept, report.objects_kept
+    )?;
+    if report.objects_waiting > 0 {
+        writeln!(
+            out,
+            "{} more objects are unused but were written in the last day; a later gc drops them",
+            report.objects_waiting
+        )?;
+    }
+    Ok(())
 }
 
 /// `ws snapshots`: one line per snapshot, newest first.

@@ -24,6 +24,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+mod gc;
+
+pub use gc::{GcOptions, GcReport};
+
 /// The first line of a space's `FORMAT` file.
 const FORMAT: &str = "peerfs space 2";
 

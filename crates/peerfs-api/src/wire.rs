@@ -267,6 +267,37 @@ pub enum SnapshotResponse {
     Unchanged,
 }
 
+/// `POST /v1/gc`: drop what the space no longer needs to keep, under its retention.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcRequest {
+    /// Report what would be dropped, and drop nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// The result of `POST /v1/gc`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GcResponse {
+    /// Whether this was a dry run, which dropped nothing.
+    pub dry_run: bool,
+    /// Objects kept.
+    pub objects_kept: usize,
+    /// Objects dropped, or that would be.
+    pub objects_dropped: usize,
+    /// Objects to drop that wait for the grace period.
+    pub objects_waiting: usize,
+    /// Bytes of packs freed, or that would be.
+    pub bytes_freed: u64,
+    /// Packs rewritten, or that would be.
+    pub packs_rewritten: usize,
+    /// Snapshots kept.
+    pub snapshots_kept: usize,
+    /// Snapshots dropped, or that would be.
+    pub snapshots_dropped: usize,
+}
+
 /// `POST /v1/workspaces/{name}/restore`: restore the workspace's source paths to one of
 /// its current change's snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

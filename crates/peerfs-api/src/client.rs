@@ -15,10 +15,10 @@ use tokio::net::UnixStream;
 use crate::wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
-    HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, MountInfo,
-    PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, RestoreRequest,
-    RestoreResponse, Revision, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo,
-    WorkspaceInfo,
+    GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest,
+    MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
+    ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SnapshotRequest, SnapshotResponse,
+    SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -659,6 +659,16 @@ impl Client {
         let route = format!("/v1/workspaces/{}/mount", segment(workspace));
         self.call_json(Method::DELETE, &route, None::<&()>).await?;
         Ok(())
+    }
+
+    /// Drops what the space no longer needs to keep: snapshots past their retention and
+    /// objects nothing reaches. A dry run reports the same and drops nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server cannot be reached or answers with an error.
+    pub async fn gc(&self, request: &GcRequest) -> Result<GcResponse, ClientError> {
+        self.json(Method::POST, "/v1/gc", Some(request)).await
     }
 
     /// The mounted workspaces.

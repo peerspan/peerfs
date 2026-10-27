@@ -461,3 +461,22 @@ fn restore_goes_back_to_a_snapshot_by_the_start_of_its_id() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("no snapshot 01ffff"));
 }
+
+#[test]
+fn gc_reports_and_keeps_what_is_new() {
+    let space = new_space();
+    let run = |args: &[&str], stdin: Option<&str>| ok(&peerfs(&space.path, "a", args, stdin));
+    run(&["ws", "create", "w"], None);
+    run(&["ws", "write", "w", "notes.txt"], Some("one\n"));
+    run(&["ws", "snapshot", "w"], None);
+    run(&["ws", "discard", "w"], None);
+
+    let dry = run(&["gc", "--dry-run"], None);
+    assert!(dry.starts_with("would drop 0 snapshots"), "{dry}");
+    assert!(dry.contains("kept 1 snapshots"), "{dry}");
+    let real = run(&["gc"], None);
+    assert!(
+        real.starts_with("dropped 0 snapshots and 0 objects"),
+        "{real}"
+    );
+}
