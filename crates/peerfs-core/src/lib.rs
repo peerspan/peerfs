@@ -23,6 +23,7 @@
 //! # }
 //! ```
 
+mod classes;
 mod codec;
 mod edit;
 mod error;
@@ -37,6 +38,7 @@ mod store;
 mod sync;
 mod workspace;
 
+pub use classes::{Class, DEFAULT_DERIVED, DEFAULT_SECRET, OwnerRules};
 pub use codec::DecodeError;
 pub use error::{Error, Result};
 pub use id::{Algorithm, DIGEST_LEN, ENCODED_LEN, ObjectId, ParseIdError};

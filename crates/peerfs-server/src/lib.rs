@@ -673,20 +673,29 @@ async fn changes(
     UrlPath(name): UrlPath<String>,
 ) -> ApiResult<Json<Vec<ChangeInfo>>> {
     with_space(&state, move |space, _| {
-        let changes = space.workspace(&name)?.changes()?;
-        Ok(Json(
-            changes
-                .into_iter()
-                .map(|change| match change {
-                    Change::Written(path) => ChangeInfo::Written {
-                        path: path.to_string(),
-                    },
-                    Change::Removed(path) => ChangeInfo::Removed {
-                        path: path.to_string(),
-                    },
-                })
-                .collect(),
-        ))
+        let workspace = space.workspace(&name)?;
+        let mut infos = Vec::new();
+        for change in workspace.changes(space)? {
+            infos.push(match change {
+                Change::Added(path) => ChangeInfo::Added {
+                    path: path.to_string(),
+                },
+                Change::Written(path) => ChangeInfo::Written {
+                    path: path.to_string(),
+                },
+                Change::Removed(path) => ChangeInfo::Removed {
+                    path: path.to_string(),
+                },
+                other => return Err(ApiError::internal(&format!("{other:?}"))),
+            });
+        }
+        for (path, class) in workspace.kept_local(space)? {
+            infos.push(ChangeInfo::Kept {
+                path: path.to_string(),
+                class: class.to_string(),
+            });
+        }
+        Ok(Json(infos))
     })
     .await
 }

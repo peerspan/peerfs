@@ -88,7 +88,7 @@ async fn a_workspace_round_trip_over_the_socket() {
     assert_eq!(listing[0].kind, EntryKind::File);
     assert_eq!(
         client.changes("w").await.unwrap(),
-        vec![ChangeInfo::Written {
+        vec![ChangeInfo::Added {
             path: "src/a b.txt".to_owned()
         }]
     );

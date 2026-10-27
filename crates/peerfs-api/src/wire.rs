@@ -200,11 +200,17 @@ pub struct DirEntry {
     pub kind: EntryKind,
 }
 
-/// One uncommitted change of `GET /v1/workspaces/{name}/changes`.
+/// One entry of `GET /v1/workspaces/{name}/changes`: what a commit would take, then the
+/// derived and secret paths it leaves in the workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ChangeInfo {
-    /// The path was written.
+    /// A path the base does not have was written.
+    Added {
+        /// The path.
+        path: String,
+    },
+    /// A path the base has was written.
     Written {
         /// The path.
         path: String,
@@ -213,6 +219,14 @@ pub enum ChangeInfo {
     Removed {
         /// The path.
         path: String,
+    },
+    /// A derived or secret path, kept in the workspace and never committed. Only the
+    /// outermost such path is listed.
+    Kept {
+        /// The path.
+        path: String,
+        /// `derived` or `secret`.
+        class: String,
     },
 }
 

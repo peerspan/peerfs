@@ -13,7 +13,8 @@
 //!   content fails with `EXDEV`, as on kernel overlay file systems, so `mv` copies instead.
 //! - Inode numbers are given per path and follow renames.
 //! - A base file's modification time is when this mount first saw its content at that
-//!   path, so committing or pulling changes it only where the content changed.
+//!   path. An overlay file's own mtime is not carried over when it is committed, and a new
+//!   mount starts afresh, so both make builds redo work once.
 //!
 //! Not supported: hard links, special files, extended attributes, and file locks beyond
 //! what the kernel does itself.

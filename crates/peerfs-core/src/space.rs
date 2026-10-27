@@ -5,6 +5,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::classes::OwnerRules;
 use crate::codec::len_u64;
 use crate::edit::TreeEdit;
 use crate::error::{Error, Result};
@@ -26,6 +27,9 @@ const FORMAT: &str = "peerfs space 2";
 
 /// The space's signing key, until the host daemon signs for it.
 const KEY_FILE: &str = "signing.key";
+
+/// The owner's path-class rules.
+const CLASSES_FILE: &str = "classes";
 
 /// The keys this space trusts for other hosts, until the host daemon supplies them.
 const HOSTS_FILE: &str = "hosts";
@@ -218,6 +222,15 @@ impl Space {
     /// The key this space's commits are signed with, if it signs them.
     pub fn public_key(&self) -> Option<PublicKey> {
         self.signer.as_ref().map(|signer| signer.public_key())
+    }
+
+    /// The owner's path-class rules, from the space's `classes` file.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file cannot be read or is malformed.
+    pub fn owner_rules(&self) -> Result<OwnerRules> {
+        OwnerRules::load(&self.dir.join(CLASSES_FILE))
     }
 
     /// The host keys listed in the space's `hosts` file.
@@ -488,7 +501,7 @@ impl Space {
             .resolve(revision)?
             .ok_or_else(|| Error::NoSuchBranch(revision.to_owned()))?;
         let theirs_tree = self.commit(theirs)?.tree;
-        if !workspace.changes()?.is_empty() || workspace.merging().is_some() {
+        if !workspace.changes(self)?.is_empty() || workspace.merging().is_some() {
             return Err(Error::WorkspaceNotClean(workspace.name().to_owned()));
         }
         let branch = workspace.branch().to_owned();
@@ -496,14 +509,14 @@ impl Space {
             .branch(&branch)?
             .ok_or_else(|| Error::NoSuchBranch(branch.clone()))?;
         if workspace.base() != head {
-            workspace.reset(head)?;
+            workspace.reset(self, head)?;
         }
         if self.is_ancestor(theirs, head)? {
             return Ok(MergeOutcome::UpToDate);
         }
         if self.is_ancestor(head, theirs)? {
             self.update_branch(&branch, Some(head), theirs)?;
-            workspace.reset(theirs)?;
+            workspace.reset(self, theirs)?;
             return Ok(MergeOutcome::FastForward { commit: theirs });
         }
         let head_tree = self.commit(head)?.tree;
@@ -528,7 +541,7 @@ impl Space {
             signature: None,
         })?;
         self.update_branch(&branch, Some(head), commit)?;
-        workspace.finish_change(commit)?;
+        workspace.finish_change(self, commit)?;
         Ok(MergeOutcome::Merged { commit })
     }
 
@@ -1078,7 +1091,7 @@ impl Space {
         let merging = workspace.merging();
         if ours == base_tree && merging.is_none() {
             if head != base_commit {
-                workspace.reset(head)?;
+                workspace.reset(self, head)?;
             }
             return Ok(CommitOutcome::Unchanged);
         }
@@ -1110,7 +1123,7 @@ impl Space {
             signature: None,
         })?;
         self.update_branch(&branch, Some(head), commit)?;
-        workspace.finish_change(commit)?;
+        workspace.finish_change(self, commit)?;
         Ok(CommitOutcome::Committed { commit, merged })
     }
 

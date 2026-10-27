@@ -61,10 +61,10 @@ fn reads_see_the_overlay_over_the_base() {
         ]
     );
     assert_eq!(
-        ws.changes().unwrap(),
+        ws.changes(&space).unwrap(),
         vec![
             Change::Written(TreePath::try_from("a.txt").unwrap()),
-            Change::Written(TreePath::try_from("new/c.txt").unwrap()),
+            Change::Added(TreePath::try_from("new/c.txt").unwrap()),
             Change::Removed(TreePath::try_from("dir").unwrap()),
         ]
     );

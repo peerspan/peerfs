@@ -318,7 +318,7 @@ fn a_mounted_workspace_is_edited_as_a_directory_and_committed() {
 
     std::fs::create_dir(mountpoint.join("src")).expect("mkdir");
     std::fs::write(mountpoint.join("src/main.rs"), "fn main() {}\n").expect("write");
-    assert_eq!(run(&["ws", "status", "w"]).trim(), "M src/main.rs");
+    assert_eq!(run(&["ws", "status", "w"]).trim(), "A src/main.rs");
     run(&["ws", "commit", "w", "-m", "From the mount"]);
     assert_eq!(
         std::fs::read_to_string(mountpoint.join("src/main.rs")).expect("read"),

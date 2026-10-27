@@ -10,6 +10,7 @@ use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
+use crate::classes::{Class, Classifier};
 use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::{ChangeId, Entry, FileMode, Name, Tree};
@@ -64,8 +65,11 @@ pub enum NewEntry<'target> {
 
 /// An uncommitted change in a workspace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Change {
-    /// The path was written.
+    /// A file or link the base does not have was written.
+    Added(TreePath),
+    /// A file or link the base has was written.
     Written(TreePath),
     /// The path, and anything under it, was removed from the base.
     Removed(TreePath),
@@ -192,10 +196,10 @@ impl Workspace {
 
     /// Ends the current change: follows `commit` with an empty overlay and starts a new
     /// change with no snapshots.
-    pub(crate) fn finish_change(&mut self, commit: ObjectId) -> Result<()> {
+    pub(crate) fn finish_change(&mut self, space: &Space, commit: ObjectId) -> Result<()> {
         self.change = ChangeId::random();
         self.snapshot = None;
-        self.reset(commit)
+        self.reset(space, commit)
     }
 
     /// The commit being merged in, when a merge stopped on conflicts. Committing the
@@ -596,34 +600,70 @@ impl Workspace {
         Ok(entries.into_iter().collect())
     }
 
-    /// The uncommitted changes: paths written, then paths removed.
+    /// The uncommitted changes a commit would take: source paths added or written, then
+    /// paths removed. Derived and secret paths are left out; see [`Workspace::kept_local`].
     ///
     /// # Errors
     ///
-    /// Fails on a file system error.
-    pub fn changes(&self) -> Result<Vec<Change>> {
+    /// Fails on a file system or store error.
+    pub fn changes(&self, space: &Space) -> Result<Vec<Change>> {
         let mut changes = Vec::new();
-        walk_upper(&upper(&self.dir), &TreePath::root(), &mut |path, local| {
-            if !local.is_dir() {
-                changes.push(Change::Written(path));
+        for (path, local) in self.classified(space)?.source {
+            if local.is_dir() {
+                continue;
             }
-            Ok(())
-        })?;
+            changes.push(if self.base_entry(space, &path)?.is_some() {
+                Change::Written(path)
+            } else {
+                Change::Added(path)
+            });
+        }
         changes.extend(self.whiteouts.iter().cloned().map(Change::Removed));
         Ok(changes)
     }
 
-    /// Applies the overlay to `base_tree` and returns the resulting tree.
+    /// The overlay's derived and secret paths, outermost only: they stay in the workspace
+    /// across commits, and no commit or snapshot takes them.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a file system or store error.
+    pub fn kept_local(&self, space: &Space) -> Result<Vec<(TreePath, Class)>> {
+        Ok(self.classified(space)?.local)
+    }
+
+    /// The classifier for this workspace's view: the space owner's rules, and the
+    /// `.gitignore` files the workspace shows.
+    fn classifier<'view>(&'view self, space: &'view Space) -> Result<Classifier<'view>> {
+        let owner = space.owner_rules()?;
+        Ok(Classifier::new(&owner, move |dir: &TreePath| {
+            let file = Name::try_from(".gitignore").ok()?;
+            self.read(space, &dir.join(&file).to_string()).ok()
+        }))
+    }
+
+    /// The overlay's entries by class: source files, links and empty directories to
+    /// commit, and the outermost derived and secret paths to keep.
+    fn classified(&self, space: &Space) -> Result<Classified> {
+        let mut rules = self.classifier(space)?;
+        let mut sorted = Classified::default();
+        walk_classified(
+            &upper(&self.dir),
+            &TreePath::root(),
+            &mut rules,
+            &mut sorted,
+        )?;
+        Ok(sorted)
+    }
+
+    /// Applies the overlay's source entries and removals to `base_tree` and returns the
+    /// resulting tree.
     pub(crate) fn apply(&self, space: &mut Space, base_tree: ObjectId) -> Result<ObjectId> {
+        let written = self.classified(space)?.source;
         let mut edit = space.edit(base_tree)?;
         for removed in &self.whiteouts {
             edit.remove(space, removed)?;
         }
-        let mut written = Vec::new();
-        walk_upper(&upper(&self.dir), &TreePath::root(), &mut |path, local| {
-            written.push((path, local.to_owned()));
-            Ok(())
-        })?;
         for (path, local) in written {
             let meta = fs::symlink_metadata(&local).map_err(|e| Error::io("reading", &local, e))?;
             let entry = if meta.is_dir() {
@@ -648,11 +688,11 @@ impl Workspace {
         edit.finish(space)
     }
 
-    /// Drops the overlay and follows `commit`.
-    pub(crate) fn reset(&mut self, commit: ObjectId) -> Result<()> {
-        let local = upper(&self.dir);
-        fs::remove_dir_all(&local).map_err(|e| Error::io("clearing", &local, e))?;
-        fs::create_dir(&local).map_err(|e| Error::io("creating", &local, e))?;
+    /// Drops the overlay's source entries and removals, keeps its derived and secret
+    /// paths, and follows `commit`.
+    pub(crate) fn reset(&mut self, space: &Space, commit: ObjectId) -> Result<()> {
+        let kept = self.kept_local(space)?;
+        prune_upper(&upper(&self.dir), &TreePath::root(), &kept)?;
         self.whiteouts.clear();
         self.merging = None;
         self.base = commit;
@@ -667,7 +707,7 @@ impl Workspace {
         head_tree: ObjectId,
         target: ObjectId,
     ) -> Result<()> {
-        self.reset(head)?;
+        self.reset(space, head)?;
         self.materialize(
             space,
             &TreePath::root(),
@@ -765,11 +805,22 @@ fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     sync_dir(dir)
 }
 
-/// Calls `visit` for every file, link and empty directory under `dir`, with its tree path.
-fn walk_upper(
+/// An overlay's entries by class.
+#[derive(Debug, Default)]
+struct Classified {
+    /// Source files, links and empty directories, with their local paths.
+    source: Vec<(TreePath, PathBuf)>,
+    /// The outermost derived and secret paths.
+    local: Vec<(TreePath, Class)>,
+}
+
+/// Sorts the entries under `dir`, whose tree path is `path` and which is source, by
+/// class. A derived or secret directory is not entered.
+fn walk_classified(
     dir: &Path,
     path: &TreePath,
-    visit: &mut impl FnMut(TreePath, &Path) -> Result<()>,
+    rules: &mut Classifier<'_>,
+    sorted: &mut Classified,
 ) -> Result<()> {
     let mut entries = fs::read_dir(dir)
         .map_err(|e| Error::io("listing", dir, e))?
@@ -789,22 +840,66 @@ fn walk_upper(
             });
         };
         let child = path.join(&name);
-        let kind = entry
+        let file_type = entry
             .file_type()
             .map_err(|e| Error::io("reading", &local, e))?;
-        if kind.is_dir() {
-            let empty = fs::read_dir(&local)
-                .map_err(|e| Error::io("listing", &local, e))?
-                .next()
-                .is_none();
-            if empty {
-                visit(child, &local)?;
-            } else {
-                walk_upper(&local, &child, visit)?;
-            }
+        let kind = if file_type.is_dir() {
+            EntryKind::Directory
+        } else if file_type.is_symlink() {
+            EntryKind::Symlink
         } else {
-            visit(child, &local)?;
+            EntryKind::File
+        };
+        let class = rules.classify_child(&child, kind);
+        if class != Class::Source {
+            sorted.local.push((child, class));
+            continue;
+        }
+        if kind != EntryKind::Directory {
+            sorted.source.push((child, local));
+            continue;
+        }
+        let empty = fs::read_dir(&local)
+            .map_err(|e| Error::io("listing", &local, e))?
+            .next()
+            .is_none();
+        if empty {
+            sorted.source.push((child, local));
+        } else {
+            walk_classified(&local, &child, rules, sorted)?;
         }
     }
     Ok(())
+}
+
+/// Removes everything under `dir` except the `kept` paths and the directories leading to
+/// them. Returns whether anything under `dir` was kept.
+fn prune_upper(dir: &Path, path: &TreePath, kept: &[(TreePath, Class)]) -> Result<bool> {
+    let mut kept_any = false;
+    for entry in fs::read_dir(dir).map_err(|e| Error::io("listing", dir, e))? {
+        let entry = entry.map_err(|e| Error::io("listing", dir, e))?;
+        let local = entry.path();
+        let meta = fs::symlink_metadata(&local).map_err(|e| Error::io("reading", &local, e))?;
+        let Some(name) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| Name::try_from(name).ok())
+        else {
+            // No commit could have taken it, so nothing keeps it.
+            remove_local(&local, &meta)?;
+            continue;
+        };
+        let child = path.join(&name);
+        if kept.iter().any(|(kept, _)| *kept == child) {
+            kept_any = true;
+            continue;
+        }
+        let leads_to_kept = meta.is_dir() && kept.iter().any(|(kept, _)| kept.starts_with(&child));
+        if leads_to_kept && prune_upper(&local, &child, kept)? {
+            kept_any = true;
+        } else {
+            remove_local(&local, &meta)?;
+        }
+    }
+    Ok(kept_any)
 }

@@ -555,8 +555,12 @@ async fn workspace(
         WorkspaceCommand::Status { name } => {
             for change in client.changes(&name).await? {
                 match change {
+                    ChangeInfo::Added { path } => writeln!(out, "A {path}")?,
                     ChangeInfo::Written { path } => writeln!(out, "M {path}")?,
                     ChangeInfo::Removed { path } => writeln!(out, "D {path}")?,
+                    ChangeInfo::Kept { path, class } => {
+                        writeln!(out, "  {path} (kept local: {class})")?;
+                    }
                 }
             }
         }
