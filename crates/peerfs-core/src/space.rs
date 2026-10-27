@@ -19,7 +19,7 @@ use crate::refs::Refs;
 use crate::sign::{HostKeys, KeyFile, KnownHosts, PublicKey, Signer, sign_commit};
 use crate::store::{Store, sync_dir};
 use crate::sync::{Pull, Pulled, Push, RawObject, Remote, Tracking, TrackingRefs, accept_objects};
-use crate::workspace::Workspace;
+use crate::workspace::{Generation, Workspace};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -58,6 +58,8 @@ pub struct Space {
     tracking: TrackingRefs,
     signer: Option<Box<dyn Signer>>,
     host_keys: Box<dyn HostKeys>,
+    /// Each workspace's count of writes to its state and whiteouts, shared by its values.
+    generations: RefCell<HashMap<Name, Generation>>,
     /// Decoded trees, which never change, so lookups do not decode them again.
     trees: RefCell<HashMap<ObjectId, Arc<Tree>>>,
     _lock: File,
@@ -212,6 +214,7 @@ impl Space {
             tracking: TrackingRefs::new(dir.join("refs/remotes")),
             signer,
             host_keys: Box::new(KnownHosts::new(dir.join(HOSTS_FILE))),
+            generations: RefCell::new(HashMap::new()),
             trees: RefCell::new(HashMap::new()),
             _lock: lock,
         })
@@ -982,7 +985,8 @@ impl Space {
         if dir.exists() {
             return Err(Error::WorkspaceExists(workspace.to_owned()));
         }
-        Workspace::create(dir, name, branch_name(branch)?, head)
+        let generation = self.generation(&name);
+        Workspace::create(dir, name, branch_name(branch)?, head, generation)
     }
 
     /// Opens an existing workspace.
@@ -996,7 +1000,18 @@ impl Space {
         if !dir.exists() {
             return Err(Error::NoSuchWorkspace(workspace.to_owned()));
         }
-        Workspace::open(dir, name)
+        let generation = self.generation(&name);
+        Workspace::open(dir, name, generation)
+    }
+
+    /// The count of writes to the workspace's state and whiteouts that its values share.
+    fn generation(&self, name: &Name) -> Generation {
+        Arc::clone(
+            self.generations
+                .borrow_mut()
+                .entry(name.clone())
+                .or_default(),
+        )
     }
 
     /// The names of every workspace.
@@ -1024,7 +1039,12 @@ impl Space {
     /// Fails if there is no such workspace or on a file system error.
     pub fn discard_workspace(&mut self, workspace: &str) -> Result<()> {
         let dir = self.workspace(workspace)?.dir().to_owned();
-        fs::remove_dir_all(&dir).map_err(|e| Error::io("removing", dir, e))
+        fs::remove_dir_all(&dir).map_err(|e| Error::io("removing", &dir, e))?;
+        // Values of the discarded workspace are stale.
+        if let Ok(name) = Name::try_from(workspace) {
+            self.generation(&name).discarded();
+        }
+        Ok(())
     }
 
     /// Takes an unsigned snapshot of the workspace, for the current change: a commit of its

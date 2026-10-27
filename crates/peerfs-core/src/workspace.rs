@@ -8,8 +8,10 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::classes::{Class, Classifier};
@@ -90,48 +92,29 @@ pub struct Workspace {
     whiteouts: BTreeSet<TreePath>,
     /// The base commit's tree, once looked up.
     base_tree: Cell<Option<ObjectId>>,
-    /// The state and whiteout files as this value last read or wrote them.
-    freshness: Freshness,
+    /// Counts this workspace's changes by any of its values.
+    generation: Generation,
+    /// The state count as of this value's last read or write.
+    seen: u64,
     /// When each base entry was first seen at its path, loaded on first use.
     stamps: Option<HashMap<TreePath, (u64, SystemTime)>>,
 }
 
-/// Identifies a version of a file: its inode, length and modification time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct FileVersion {
-    inode: u64,
-    len: u64,
-    modified: (i64, i64),
+/// Counts a workspace's changes, shared by every value of it that a space opened. The
+/// space's lock keeps other processes out, so they see every change.
+#[derive(Debug, Default)]
+pub(crate) struct Counts {
+    /// Writes to the state and whiteouts.
+    state: AtomicU64,
 }
 
-impl FileVersion {
-    fn of(path: &Path) -> Self {
-        fs::metadata(path).map_or_else(
-            |_| Self::default(),
-            |meta| Self {
-                inode: meta.ino(),
-                len: meta.len(),
-                modified: (meta.mtime(), meta.mtime_nsec()),
-            },
-        )
+impl Counts {
+    pub(crate) fn discarded(&self) {
+        self.state.fetch_add(1, Ordering::AcqRel);
     }
 }
 
-/// The versions of a workspace's state and whiteout files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct Freshness {
-    state: FileVersion,
-    whiteouts: FileVersion,
-}
-
-impl Freshness {
-    fn of(dir: &Path) -> Self {
-        Self {
-            state: FileVersion::of(&dir.join(STATE)),
-            whiteouts: FileVersion::of(&dir.join(WHITEOUTS)),
-        }
-    }
-}
+pub(crate) type Generation = Arc<Counts>;
 
 const STATE: &str = "state";
 const WHITEOUTS: &str = "whiteouts";
@@ -188,7 +171,13 @@ fn upper(dir: &Path) -> PathBuf {
 }
 
 impl Workspace {
-    pub(crate) fn create(dir: PathBuf, name: Name, branch: Name, base: ObjectId) -> Result<Self> {
+    pub(crate) fn create(
+        dir: PathBuf,
+        name: Name,
+        branch: Name,
+        base: ObjectId,
+        generation: Generation,
+    ) -> Result<Self> {
         fs::create_dir_all(upper(&dir)).map_err(|e| Error::io("creating", &dir, e))?;
         let workspace = Self {
             dir,
@@ -200,7 +189,8 @@ impl Workspace {
             merging: None,
             whiteouts: BTreeSet::new(),
             base_tree: Cell::new(None),
-            freshness: Freshness::default(),
+            seen: generation.state.load(Ordering::Acquire),
+            generation,
             stamps: None,
         };
         let mut workspace = workspace;
@@ -212,8 +202,8 @@ impl Workspace {
         Ok(workspace)
     }
 
-    pub(crate) fn open(dir: PathBuf, name: Name) -> Result<Self> {
-        let freshness = Freshness::of(&dir);
+    pub(crate) fn open(dir: PathBuf, name: Name, generation: Generation) -> Result<Self> {
+        let seen = generation.state.load(Ordering::Acquire);
         let state_path = dir.join(STATE);
         let state =
             fs::read_to_string(&state_path).map_err(|e| Error::io("reading", &state_path, e))?;
@@ -271,16 +261,18 @@ impl Workspace {
             merging,
             whiteouts,
             base_tree: Cell::new(None),
-            freshness,
+            generation,
+            seen,
             stamps: None,
         })
     }
 
-    /// Whether this value still matches the workspace on disk: no other value of it has
-    /// changed its state or removals since this one last read or wrote them. Files in the
-    /// overlay are always read from disk, so they never make a value stale.
+    /// Whether this value still matches the workspace on disk: no other value of it from
+    /// this space has changed its state or removals since this one last read or wrote them.
+    /// The space's lock keeps other processes from changing them. Files in the overlay are
+    /// always read from disk, so they never make a value stale.
     pub fn is_current(&self) -> bool {
-        Freshness::of(&self.dir) == self.freshness
+        self.generation.state.load(Ordering::Acquire) == self.seen
     }
 
     /// When the base entry `entry` at `path` is dated: when this workspace first saw that
@@ -439,6 +431,15 @@ impl Workspace {
         full
     }
 
+    /// Counts a write to the state or whiteouts, which makes every other value stale.
+    fn wrote(&mut self) {
+        let now = self.generation.state.fetch_add(1, Ordering::AcqRel) + 1;
+        // Another value's write since this one last read still makes it stale.
+        if self.seen + 1 == now {
+            self.seen = now;
+        }
+    }
+
     /// Writes the state file.
     fn save(&mut self) -> Result<()> {
         let snapshot = self
@@ -454,7 +455,7 @@ impl Workspace {
             self.branch, self.base, self.change
         );
         write_synced(&self.dir, STATE, state.as_bytes())?;
-        self.freshness = Freshness::of(&self.dir);
+        self.wrote();
         Ok(())
     }
 
@@ -466,7 +467,7 @@ impl Workspace {
             whiteouts.push('\n');
         }
         write_synced(&self.dir, WHITEOUTS, whiteouts.as_bytes())?;
-        self.freshness = Freshness::of(&self.dir);
+        self.wrote();
         Ok(())
     }
 
@@ -497,7 +498,7 @@ impl Workspace {
                 file.sync_data()
             })
             .map_err(|e| Error::io("writing", &log, e))?;
-        self.freshness = Freshness::of(&self.dir);
+        self.wrote();
         Ok(())
     }
 

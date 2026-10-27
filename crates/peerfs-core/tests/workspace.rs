@@ -292,3 +292,33 @@ fn a_workspace_needs_an_existing_branch_and_a_fresh_name() {
         Err(Error::NoSuchWorkspace(_))
     ));
 }
+
+#[test]
+fn a_value_goes_stale_when_another_changes_the_workspace() {
+    let (_dir, mut space) = space_with(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
+    let mut first = space.create_workspace("w", "main").expect("workspace");
+    let mut second = space.workspace("w").expect("workspace");
+    assert!(first.is_current() && second.is_current());
+
+    // Writing an overlay file changes neither state nor removals.
+    first.write(&space, "c.txt", b"c\n").expect("write");
+    assert!(second.is_current());
+
+    second.remove(&space, "a.txt").expect("remove");
+    assert!(second.is_current(), "its own change");
+    assert!(!first.is_current());
+
+    let mut first = space.workspace("w").expect("workspace");
+    assert!(first.is_current());
+    committed(
+        space
+            .commit_workspace(&mut first, "change", &author("agent"))
+            .expect("commit"),
+    );
+    assert!(!second.is_current(), "a commit moves the base");
+
+    let other = space.create_workspace("other", "main").expect("workspace");
+    space.discard_workspace("w").expect("discard");
+    assert!(!first.is_current(), "discarded");
+    assert!(other.is_current(), "each workspace counts its own");
+}
