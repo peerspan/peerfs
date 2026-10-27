@@ -125,6 +125,11 @@ impl Store {
         self.index.contains_key(id)
     }
 
+    /// The kind of `id`, if the store holds it, without reading it.
+    pub(crate) fn kind_of(&self, id: &ObjectId) -> Option<Kind> {
+        self.index.get(id).map(|location| location.kind)
+    }
+
     /// The number of objects stored.
     pub(crate) fn len(&self) -> usize {
         self.index.len()

@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use peerfs_api::{Caller, ChangeInfo, Client, CommitResponse, EntryKind, Method, Revision};
+use peerfs_api::{
+    Caller, ChangeInfo, Client, CommitResponse, EntryKind, MergeResponse, Method, Revision,
+};
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
 
@@ -353,4 +355,123 @@ async fn pull_and_fetch_reject_bad_requests() {
     let too_many: Vec<String> = (0..300).map(|_| "00".repeat(33)).collect();
     let refused = server.client.fetch_objects(&too_many).await.unwrap_err();
     assert_eq!(refused.code(), Some("invalid"));
+}
+
+#[tokio::test]
+async fn push_is_refused_when_the_home_moved_then_pull_merge_and_push_again() {
+    let server = start_on("server", None).await;
+    let laptop = start_on("laptop", None).await;
+    commit_files(
+        &server.client,
+        "w",
+        &[("shared.txt", "one\ntwo\nthree\nfour\nfive\n")],
+    )
+    .await;
+    let server_socket = server.client.socket().to_str().unwrap().to_owned();
+
+    laptop.client.pull(&server_socket, "main").await.unwrap();
+    laptop.client.fork("work", "server/main").await.unwrap();
+    laptop.client.create_workspace("lw", "work").await.unwrap();
+    laptop
+        .client
+        .write("lw", "laptop.txt", "from the laptop\n")
+        .await
+        .unwrap();
+    laptop
+        .client
+        .commit("lw", "laptop", &caller("laptop"))
+        .await
+        .unwrap();
+
+    let pushed = laptop
+        .client
+        .push(&server_socket, "main", "work")
+        .await
+        .unwrap();
+    assert_eq!(pushed.remote, "server");
+    assert_eq!(pushed.objects, 3);
+    assert_eq!(server.client.branches().await.unwrap()[0].head, pushed.head);
+    assert_eq!(laptop.client.remotes().await.unwrap()[0].head, pushed.head);
+
+    // The server moves on; the laptop's next push is refused rather than dropping it.
+    commit_files(
+        &server.client,
+        "w",
+        &[("shared.txt", "ONE\ntwo\nthree\nfour\nfive\n")],
+    )
+    .await;
+    laptop
+        .client
+        .write("lw", "shared.txt", "one\ntwo\nthree\nfour\nFIVE\n")
+        .await
+        .unwrap();
+    laptop
+        .client
+        .commit("lw", "laptop", &caller("laptop"))
+        .await
+        .unwrap();
+    let refused = laptop
+        .client
+        .push(&server_socket, "main", "work")
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Some("conflict"), "{refused}");
+    assert!(
+        refused.to_string().contains("pull server/main"),
+        "{refused}"
+    );
+
+    // Pull, merge into the laptop's branch, push again.
+    laptop.client.pull(&server_socket, "main").await.unwrap();
+    let merged = laptop
+        .client
+        .merge("lw", "server/main", &caller("laptop"))
+        .await
+        .unwrap();
+    assert!(matches!(merged, MergeResponse::Merged { .. }), "{merged:?}");
+    let pushed = laptop
+        .client
+        .push(&server_socket, "main", "work")
+        .await
+        .unwrap();
+    server
+        .client
+        .create_workspace("check", "main")
+        .await
+        .unwrap();
+    assert_eq!(
+        &server.client.read("check", "shared.txt").await.unwrap()[..],
+        b"ONE\ntwo\nthree\nfour\nFIVE\n"
+    );
+    let log = server.client.log("main", Some(1)).await.unwrap();
+    assert_eq!(log[0].id, pushed.head);
+    assert_eq!(log[0].parents.len(), 2, "a merge commit");
+}
+
+#[tokio::test]
+async fn two_hosts_pushing_to_one_home_at_once_cannot_both_win() {
+    let server = start_on("server", None).await;
+    let first = start_on("first", None).await;
+    let second = start_on("second", None).await;
+    commit_files(&server.client, "w", &[("base.txt", "base\n")]).await;
+    let server_socket = server.client.socket().to_str().unwrap().to_owned();
+    for (laptop, file) in [(&first, "first.txt"), (&second, "second.txt")] {
+        laptop.client.pull(&server_socket, "main").await.unwrap();
+        laptop.client.fork("work", "server/main").await.unwrap();
+        laptop.client.create_workspace("lw", "work").await.unwrap();
+        laptop.client.write("lw", file, "x\n").await.unwrap();
+        laptop
+            .client
+            .commit("lw", "work", &caller(file))
+            .await
+            .unwrap();
+    }
+    let (a, b) = tokio::join!(
+        first.client.push(&server_socket, "main", "work"),
+        second.client.push(&server_socket, "main", "work")
+    );
+    let outcomes = [a.is_ok(), b.is_ok()];
+    assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1, "{a:?} {b:?}");
+    let loser = if a.is_ok() { b } else { a };
+    assert_eq!(loser.unwrap_err().code(), Some("conflict"));
 }

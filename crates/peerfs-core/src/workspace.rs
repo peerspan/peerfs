@@ -55,6 +55,7 @@ pub struct Workspace {
     branch: Name,
     base: ObjectId,
     change: ChangeId,
+    merging: Option<ObjectId>,
     whiteouts: BTreeSet<TreePath>,
 }
 
@@ -71,6 +72,7 @@ impl Workspace {
             branch,
             base,
             change: ChangeId::random(),
+            merging: None,
             whiteouts: BTreeSet::new(),
         };
         workspace.save()?;
@@ -103,6 +105,10 @@ impl Workspace {
             .get("change")
             .and_then(|text| ChangeId::from_hex(text))
             .ok_or_else(|| corrupt("change"))?;
+        let merging = match fields.get("merge") {
+            Some(text) => Some(text.parse().map_err(|_| corrupt("merge"))?),
+            None => None,
+        };
         let whiteouts_path = dir.join("whiteouts");
         let whiteouts = match fs::read_to_string(&whiteouts_path) {
             Ok(text) => text
@@ -118,6 +124,7 @@ impl Workspace {
             branch,
             base,
             change,
+            merging,
             whiteouts,
         })
     }
@@ -142,6 +149,17 @@ impl Workspace {
         self.change
     }
 
+    /// The commit being merged in, when a merge stopped on conflicts. Committing the
+    /// workspace makes a commit with it as a second parent.
+    pub fn merging(&self) -> Option<ObjectId> {
+        self.merging
+    }
+
+    pub(crate) fn set_merging(&mut self, merging: Option<ObjectId>) -> Result<()> {
+        self.merging = merging;
+        self.save()
+    }
+
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
@@ -155,8 +173,12 @@ impl Workspace {
     }
 
     fn save(&self) -> Result<()> {
+        let merge = self
+            .merging
+            .map(|merging| format!("merge {merging}\n"))
+            .unwrap_or_default();
         let state = format!(
-            "branch {}\nbase {}\nchange {}\n",
+            "branch {}\nbase {}\nchange {}\n{merge}",
             self.branch, self.base, self.change
         );
         write_synced(&self.dir, "state", state.as_bytes())?;
@@ -396,6 +418,7 @@ impl Workspace {
         fs::remove_dir_all(&local).map_err(|e| Error::io("clearing", &local, e))?;
         fs::create_dir(&local).map_err(|e| Error::io("creating", &local, e))?;
         self.whiteouts.clear();
+        self.merging = None;
         self.base = commit;
         self.save()
     }

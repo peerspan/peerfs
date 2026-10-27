@@ -269,3 +269,104 @@ pub struct TrackingInfo {
     /// When it was pulled, in milliseconds since the Unix epoch.
     pub pulled_ms: u64,
 }
+
+/// `POST /v1/objects/have`: which of these objects the space holds, and so everything
+/// they reach. At most 256 ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaveRequest {
+    /// The objects asked about.
+    pub ids: Vec<String>,
+}
+
+/// The answer to [`HaveRequest`], one entry per id, in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaveResponse {
+    /// Whether each object is held.
+    pub have: Vec<bool>,
+}
+
+/// The answer to `POST /v1/objects/receive`, whose body is objects encoded by
+/// `peerfs_core::encode_objects`, each after everything it references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiveResponse {
+    /// How many of the objects were new.
+    pub stored: u64,
+}
+
+/// `POST /v1/branches/{name}/advance`: move a branch held here, as its home host does for
+/// a push. `new` must already be held, and its history must contain `expected`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvanceRequest {
+    /// The head the branch must still have; absent to create the branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    /// The commit to move it to.
+    pub new: String,
+}
+
+/// `POST /v1/push`: send a local revision to another server and move its branch there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushRequest {
+    /// The other server's socket, on this host.
+    pub to: String,
+    /// The branch there.
+    pub branch: String,
+    /// The local branch, or `<host>/<branch>`, to send.
+    pub from: String,
+}
+
+/// What a push did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PushResponse {
+    /// The other server's host.
+    pub remote: String,
+    /// The branch there.
+    pub branch: String,
+    /// Its new head.
+    pub head: String,
+    /// Objects sent.
+    pub objects: u64,
+    /// Their uncompressed bytes.
+    pub bytes: u64,
+}
+
+/// `POST /v1/workspaces/{name}/merge`: merge a revision into the branch a workspace follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeRequest {
+    /// The branch, or `<host>/<branch>`, to merge.
+    pub from: String,
+    /// Who is merging.
+    #[serde(default)]
+    pub caller: Caller,
+}
+
+/// What a merge did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MergeResponse {
+    /// The branch already contains the revision.
+    UpToDate,
+    /// The branch now points at the revision, which contained it.
+    FastForward {
+        /// The new head.
+        commit: String,
+    },
+    /// A merge commit with both histories as parents.
+    Merged {
+        /// The new head.
+        commit: String,
+    },
+    /// Nothing was committed; the workspace holds the merge with markers to resolve, and
+    /// committing it records both parents.
+    Conflicted {
+        /// Every conflict.
+        conflicts: Vec<ConflictInfo>,
+    },
+}

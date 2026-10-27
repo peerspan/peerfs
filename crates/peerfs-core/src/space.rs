@@ -16,8 +16,9 @@ use crate::object::{
 use crate::path::TreePath;
 use crate::refs::Refs;
 use crate::store::{Store, sync_dir};
-use crate::sync::{Pull, Pulled, RawObject, Remote, Tracking, TrackingRefs};
+use crate::sync::{Pull, Pulled, Push, RawObject, Remote, Tracking, TrackingRefs, accept_objects};
 use crate::workspace::Workspace;
+use std::collections::{HashSet, VecDeque};
 
 /// The first line of a space's `FORMAT` file.
 const FORMAT: &str = "peerfs space 1";
@@ -61,6 +62,27 @@ pub enum CommitOutcome {
     Conflicted(Vec<Conflict>),
     /// The workspace has no changes.
     Unchanged,
+}
+
+/// What merging a revision into a workspace did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MergeOutcome {
+    /// The branch already contains the revision.
+    UpToDate,
+    /// The revision contains the branch, which now points at it.
+    FastForward {
+        /// The new head.
+        commit: ObjectId,
+    },
+    /// The histories diverged and merged cleanly into a commit with both as parents.
+    Merged {
+        /// The merge commit, the branch's new head.
+        commit: ObjectId,
+    },
+    /// The merge conflicts. Nothing was committed. The workspace holds the merge with
+    /// markers; resolving and committing it makes a commit with both parents.
+    Conflicted(Vec<Conflict>),
 }
 
 /// Whether a commit needed a merge.
@@ -245,6 +267,209 @@ impl Space {
     /// Fails if objects are still wanted, or on a store error.
     pub fn finish_pull(&mut self, pull: Pull) -> Result<Pulled> {
         pull.finish(&mut self.store, &self.tracking)
+    }
+
+    /// Which of `ids` this space holds; the store being closed, holding one means holding
+    /// everything it reaches.
+    pub fn have(&self, ids: &[ObjectId]) -> Vec<bool> {
+        ids.iter().map(|id| self.store.contains(id)).collect()
+    }
+
+    /// Starts pushing the commit `head` to a host that may lack some of its history; see
+    /// [`Push`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if `head` is not a commit this space holds.
+    pub fn start_push(&self, head: ObjectId) -> Result<Push> {
+        self.commit(head)?;
+        Ok(Push::new(head))
+    }
+
+    /// Takes the receiver's answers for [`Push::to_ask`], `held[i]` for the `i`th object.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the answers do not match the question, or on a store error.
+    pub fn answer_push(&self, push: &mut Push, held: &[bool]) -> Result<()> {
+        push.answer(&self.store, held)
+    }
+
+    /// The objects the receiver lacks, each after everything it references: the order to
+    /// send them in.
+    ///
+    /// # Errors
+    ///
+    /// Fails if objects are still to be asked about.
+    pub fn push_order(&self, push: &Push) -> Result<Vec<ObjectId>> {
+        push.order()
+    }
+
+    /// Stores objects another host sent, in order, and makes them durable. An object that
+    /// does not match its identity, or references one this space does not hold, is refused,
+    /// so the store stays closed. Returns how many objects were new.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::RemoteObject`] at the first object refused; those before it are
+    /// kept.
+    pub fn accept_objects(&mut self, objects: &[RawObject]) -> Result<u64> {
+        accept_objects(&mut self.store, objects)
+    }
+
+    /// Moves `branch` from `expected` to `new` (`None`: creates it), as the branch's home
+    /// host does for a push. `new` must be a commit held here whose history contains
+    /// `expected`, so a push never drops commits it did not see.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::NotFastForward`] when `new` does not contain `expected`, and
+    /// [`Error::BranchMoved`] when the branch no longer points at `expected`.
+    pub fn advance_branch(
+        &mut self,
+        branch: &str,
+        expected: Option<ObjectId>,
+        new: ObjectId,
+    ) -> Result<()> {
+        let name = branch_name(branch)?;
+        if self.store.kind_of(&new) != Some(Kind::Commit) {
+            return Err(Error::MissingObject {
+                kind: Kind::Commit,
+                id: new,
+            });
+        }
+        if let Some(expected) = expected
+            && !self.is_ancestor(expected, new)?
+        {
+            return Err(Error::NotFastForward {
+                branch: branch.to_owned(),
+                new,
+            });
+        }
+        self.store.sync()?;
+        self.refs.compare_and_swap(&name, expected, new)
+    }
+
+    /// Records `head` as the latest known head of `branch` on the host `remote`, as after a
+    /// push this space made there.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a name is invalid, `head` is not held here, or on a file system error.
+    pub fn record_tracking(&mut self, remote: &str, branch: &str, head: ObjectId) -> Result<()> {
+        self.commit(head)?;
+        self.tracking
+            .set(&Name::try_from(remote)?, &branch_name(branch)?, head)
+    }
+
+    /// Whether `ancestor` is `descendant` or in its history.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a commit in the history is missing or corrupt.
+    pub fn is_ancestor(&self, ancestor: ObjectId, descendant: ObjectId) -> Result<bool> {
+        let mut queue = VecDeque::from([descendant]);
+        let mut seen = HashSet::from([descendant]);
+        while let Some(id) = queue.pop_front() {
+            if id == ancestor {
+                return Ok(true);
+            }
+            for parent in self.commit(id)?.parents {
+                if seen.insert(parent) {
+                    queue.push_back(parent);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// A common ancestor of `a` and `b` nearest to `b`, if their histories meet.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a commit in either history is missing or corrupt.
+    pub fn merge_base(&self, a: ObjectId, b: ObjectId) -> Result<Option<ObjectId>> {
+        let mut ancestors = HashSet::from([a]);
+        let mut queue = VecDeque::from([a]);
+        while let Some(id) = queue.pop_front() {
+            for parent in self.commit(id)?.parents {
+                if ancestors.insert(parent) {
+                    queue.push_back(parent);
+                }
+            }
+        }
+        let mut queue = VecDeque::from([b]);
+        let mut seen = HashSet::from([b]);
+        while let Some(id) = queue.pop_front() {
+            if ancestors.contains(&id) {
+                return Ok(Some(id));
+            }
+            for parent in self.commit(id)?.parents {
+                if seen.insert(parent) {
+                    queue.push_back(parent);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Merges `revision` (a branch, or `<remote>/<branch>`) into the branch `workspace`
+    /// follows. The workspace must have no uncommitted changes.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the revision does not exist, the workspace is not clean, or the branch
+    /// moves meanwhile.
+    pub fn merge_into_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        revision: &str,
+        author: &Author,
+    ) -> Result<MergeOutcome> {
+        let theirs = self
+            .resolve(revision)?
+            .ok_or_else(|| Error::NoSuchBranch(revision.to_owned()))?;
+        let theirs_tree = self.commit(theirs)?.tree;
+        if !workspace.changes()?.is_empty() || workspace.merging().is_some() {
+            return Err(Error::WorkspaceNotClean(workspace.name().to_owned()));
+        }
+        let branch = workspace.branch().to_owned();
+        let head = self
+            .branch(&branch)?
+            .ok_or_else(|| Error::NoSuchBranch(branch.clone()))?;
+        if workspace.base() != head {
+            workspace.reset(head)?;
+        }
+        if self.is_ancestor(theirs, head)? {
+            return Ok(MergeOutcome::UpToDate);
+        }
+        if self.is_ancestor(head, theirs)? {
+            self.update_branch(&branch, Some(head), theirs)?;
+            workspace.reset(theirs)?;
+            return Ok(MergeOutcome::FastForward { commit: theirs });
+        }
+        let head_tree = self.commit(head)?.tree;
+        let base_tree = match self.merge_base(head, theirs)? {
+            Some(base) => Some(self.commit(base)?.tree),
+            None => None,
+        };
+        let (tree, conflicts) = merge_trees(self, base_tree, head_tree, theirs_tree)?;
+        if !conflicts.is_empty() {
+            workspace.rebase(self, head, head_tree, tree)?;
+            workspace.set_merging(Some(theirs))?;
+            return Ok(MergeOutcome::Conflicted(conflicts));
+        }
+        let commit = self.put_commit(&Commit {
+            tree,
+            parents: vec![head, theirs],
+            change: workspace.change(),
+            author: author.clone(),
+            time: SystemTime::now(),
+            message: format!("Merge {revision}"),
+        })?;
+        self.update_branch(&branch, Some(head), commit)?;
+        workspace.reset(commit)?;
+        Ok(MergeOutcome::Merged { commit })
     }
 
     /// Every tracking reference: other hosts' branch heads as of their last pull.
@@ -693,7 +918,8 @@ impl Space {
         let base_commit = workspace.base();
         let base_tree = self.commit(base_commit)?.tree;
         let ours = workspace.apply(self, base_tree)?;
-        if ours == base_tree {
+        let merging = workspace.merging();
+        if ours == base_tree && merging.is_none() {
             if head != base_commit {
                 workspace.reset(head)?;
             }
@@ -706,13 +932,16 @@ impl Space {
             let (tree, conflicts) = merge_trees(self, Some(base_tree), ours, head_tree)?;
             if !conflicts.is_empty() {
                 workspace.rebase(self, head, head_tree, tree)?;
+                workspace.set_merging(merging)?;
                 return Ok(CommitOutcome::Conflicted(conflicts));
             }
             (tree, Merged::Yes)
         };
+        let mut parents = vec![head];
+        parents.extend(merging.filter(|other| *other != head));
         let commit = self.put_commit(&Commit {
             tree,
-            parents: vec![head],
+            parents,
             change: workspace.change(),
             author: author.clone(),
             time: SystemTime::now(),

@@ -13,9 +13,11 @@ use serde::de::DeserializeOwned;
 use tokio::net::UnixStream;
 
 use crate::wire::{
-    BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
+    AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
-    ImportRequest, PullRequest, PullResponse, Revision, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    HaveRequest, HaveResponse, ImportRequest, MergeRequest, MergeResponse, PullRequest,
+    PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision, SpaceInfo, TrackingInfo,
+    WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -318,6 +320,101 @@ impl Client {
     /// Fails if the server cannot be reached or answers with an error.
     pub async fn remotes(&self) -> Result<Vec<TrackingInfo>, ClientError> {
         self.json(Method::GET, "/v1/remotes", None::<&()>).await
+    }
+
+    /// Which of `ids` this space holds, in order.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `invalid` for more than 256 ids or a malformed id.
+    pub async fn have(&self, ids: &[String]) -> Result<Vec<bool>, ClientError> {
+        let request = HaveRequest { ids: ids.to_vec() };
+        let response: HaveResponse = self
+            .json(Method::POST, "/v1/objects/have", Some(&request))
+            .await?;
+        Ok(response.have)
+    }
+
+    /// Sends objects encoded by `peerfs_core::encode_objects`, each after everything it
+    /// references. Returns how many were new.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `remote` when an object does not match its identity or references one
+    /// the space does not hold; the objects before it are kept.
+    pub async fn receive_objects(&self, encoded: Bytes) -> Result<u64, ClientError> {
+        let body = self
+            .call(
+                Method::POST,
+                "/v1/objects/receive",
+                Some("application/octet-stream"),
+                encoded,
+            )
+            .await?;
+        let response: ReceiveResponse =
+            serde_json::from_slice(&body).map_err(|e| ClientError::Decode(e.to_string()))?;
+        Ok(response.stored)
+    }
+
+    /// Moves `branch` from `expected` (`None`: creates it) to the held commit `new`, which
+    /// must contain `expected` in its history.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `conflict` if the branch moved or `new` does not contain `expected`.
+    pub async fn advance(
+        &self,
+        branch: &str,
+        expected: Option<&str>,
+        new: &str,
+    ) -> Result<BranchInfo, ClientError> {
+        let path = format!("/v1/branches/{}/advance", segment(branch));
+        let request = AdvanceRequest {
+            expected: expected.map(ToOwned::to_owned),
+            new: new.to_owned(),
+        };
+        self.json(Method::POST, &path, Some(&request)).await
+    }
+
+    /// Has this server send the local revision `from` to the server at `to` and move
+    /// `branch` there to it.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `conflict` if the branch there moved since this server last saw it or
+    /// the revision does not contain it: pull, merge, and push again.
+    pub async fn push(
+        &self,
+        to: &str,
+        branch: &str,
+        from: &str,
+    ) -> Result<PushResponse, ClientError> {
+        let request = PushRequest {
+            to: to.to_owned(),
+            branch: branch.to_owned(),
+            from: from.to_owned(),
+        };
+        self.json(Method::POST, "/v1/push", Some(&request)).await
+    }
+
+    /// Merges the revision `from` into the branch a workspace follows.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `conflict` if the workspace has uncommitted changes, `not_found` if the
+    /// revision does not exist. A merge conflict is an outcome, not an error.
+    pub async fn merge(
+        &self,
+        workspace: &str,
+        from: &str,
+        caller: &Caller,
+    ) -> Result<MergeResponse, ClientError> {
+        let path = format!("/v1/workspaces/{}/merge", segment(workspace));
+        let request = MergeRequest {
+            from: from.to_owned(),
+            caller: caller.clone(),
+        };
+        self.json(Method::POST, &path, Some(&request)).await
     }
 
     /// Every workspace.

@@ -21,14 +21,15 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use peerfs_api::{
-    BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest, CommitResponse,
-    ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest,
-    FetchRequest, ForkRequest, ImportRequest, PullRequest, PullResponse, Revision, SOCKET_NAME,
-    SpaceInfo, TrackingInfo, WorkspaceInfo,
+    AdvanceRequest, BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest,
+    CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
+    ExportRequest, FetchRequest, ForkRequest, HaveRequest, HaveResponse, ImportRequest,
+    MergeRequest, MergeResponse, PullRequest, PullResponse, PushRequest, PushResponse,
+    ReceiveResponse, Revision, SOCKET_NAME, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 use peerfs_core::{
-    Author, Change, CommitOutcome, ConflictKind, Error, FETCH_BATCH, Merged, ObjectId, Space,
-    Workspace, decode_objects, encode_objects,
+    Author, Change, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH, MergeOutcome,
+    Merged, ObjectId, Space, Workspace, decode_objects, encode_objects,
 };
 use serde::Deserialize;
 use tokio::net::UnixListener;
@@ -36,6 +37,10 @@ use tokio::sync::Notify;
 
 /// The largest JSON request body, as on the host daemon's `admin.sock`.
 const JSON_LIMIT: usize = 1024 * 1024;
+
+/// The largest batch of objects received in one request: [`FETCH_BATCH`] objects of at
+/// most 256 KiB, with room for framing.
+const OBJECTS_LIMIT: usize = 128 * 1024 * 1024;
 
 /// The largest file written in one request.
 const FILE_LIMIT: usize = 1024 * 1024 * 1024;
@@ -103,6 +108,14 @@ fn router_with(state: AppState) -> Router {
         .route("/v1/workspaces/{name}/changes", get(changes))
         .route("/v1/workspaces/{name}/commit", post(commit))
         .route("/v1/objects/fetch", post(fetch_objects))
+        .route("/v1/objects/have", post(have_objects))
+        .route(
+            "/v1/objects/receive",
+            post(receive_objects).layer(DefaultBodyLimit::max(OBJECTS_LIMIT)),
+        )
+        .route("/v1/branches/{name}/advance", post(advance))
+        .route("/v1/push", post(push))
+        .route("/v1/workspaces/{name}/merge", post(merge))
         .route("/v1/pull", post(pull))
         .route("/v1/remotes", get(remotes))
         .fallback(not_found)
@@ -259,9 +272,11 @@ impl From<Error> for ApiError {
             Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 (StatusCode::NOT_FOUND, "not_found")
             }
-            Error::BranchExists(_) | Error::WorkspaceExists(_) | Error::BranchMoved { .. } => {
-                (StatusCode::CONFLICT, "conflict")
-            }
+            Error::BranchExists(_)
+            | Error::WorkspaceExists(_)
+            | Error::BranchMoved { .. }
+            | Error::NotFastForward { .. }
+            | Error::WorkspaceNotClean(_) => (StatusCode::CONFLICT, "conflict"),
             Error::InvalidName(_)
             | Error::InvalidPath(_)
             | Error::WrongEntry { .. }
@@ -623,6 +638,16 @@ async fn changes(
     .await
 }
 
+fn conflict_infos(conflicts: Vec<Conflict>) -> Vec<ConflictInfo> {
+    conflicts
+        .into_iter()
+        .map(|conflict| ConflictInfo {
+            path: conflict.path.to_string(),
+            kind: conflict_kind(conflict.kind).to_owned(),
+        })
+        .collect()
+}
+
 fn conflict_kind(kind: ConflictKind) -> &'static str {
     match kind {
         ConflictKind::Content => "content",
@@ -651,13 +676,7 @@ async fn commit(
                 merged: merged == Merged::Yes,
             },
             CommitOutcome::Conflicted(conflicts) => CommitResponse::Conflicted {
-                conflicts: conflicts
-                    .into_iter()
-                    .map(|conflict| ConflictInfo {
-                        path: conflict.path.to_string(),
-                        kind: conflict_kind(conflict.kind).to_owned(),
-                    })
-                    .collect(),
+                conflicts: conflict_infos(conflicts),
             },
             CommitOutcome::Unchanged => CommitResponse::Unchanged,
             other => return Err(ApiError::internal(&format!("{other:?}"))),
@@ -783,6 +802,198 @@ async fn remotes(State(state): State<AppState>) -> ApiResult<Json<Vec<TrackingIn
                 })
                 .collect(),
         ))
+    })
+    .await
+}
+
+fn parse_ids(ids: &[String]) -> ApiResult<Vec<ObjectId>> {
+    if ids.len() > FETCH_BATCH {
+        return Err(ApiError::invalid(format!(
+            "at most {FETCH_BATCH} objects per request, not {}",
+            ids.len()
+        )));
+    }
+    ids.iter()
+        .map(|id| {
+            id.parse::<ObjectId>()
+                .map_err(|e| ApiError::invalid(format!("object {id}: {e}")))
+        })
+        .collect()
+}
+
+async fn have_objects(
+    State(state): State<AppState>,
+    body: Result<Json<HaveRequest>, JsonRejection>,
+) -> ApiResult<Json<HaveResponse>> {
+    let Json(request) = body?;
+    let ids = parse_ids(&request.ids)?;
+    with_space(&state, move |space, _| {
+        Ok(Json(HaveResponse {
+            have: space.have(&ids),
+        }))
+    })
+    .await
+}
+
+async fn receive_objects(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<Json<ReceiveResponse>> {
+    let objects = decode_objects(&body)
+        .map_err(|e| ApiError::invalid(format!("undecodable objects: {e}")))?;
+    with_space(&state, move |space, _| {
+        Ok(Json(ReceiveResponse {
+            stored: space.accept_objects(&objects)?,
+        }))
+    })
+    .await
+}
+
+async fn advance(
+    State(state): State<AppState>,
+    UrlPath(branch): UrlPath<String>,
+    body: Result<Json<AdvanceRequest>, JsonRejection>,
+) -> ApiResult<Json<BranchInfo>> {
+    let Json(request) = body?;
+    let parse = |id: &str| {
+        id.parse::<ObjectId>()
+            .map_err(|e| ApiError::invalid(format!("commit {id}: {e}")))
+    };
+    let expected = request.expected.as_deref().map(parse).transpose()?;
+    let new = parse(&request.new)?;
+    with_space(&state, move |space, _| {
+        space.advance_branch(&branch, expected, new)?;
+        Ok(Json(BranchInfo {
+            name: branch,
+            head: new.to_string(),
+        }))
+    })
+    .await
+}
+
+/// Sends a local revision to another server and moves its branch, holding the space only
+/// between network waits.
+async fn push(
+    State(state): State<AppState>,
+    body: Result<Json<PushRequest>, JsonRejection>,
+) -> ApiResult<Json<PushResponse>> {
+    let Json(request) = body?;
+    let to = absolute(&request.to)?.to_owned();
+    let remote = Client::new(&to);
+    let info = remote.space().await?;
+    let own = with_space(&state, |space, _| Ok(space.path().to_owned())).await?;
+    if std::fs::canonicalize(&info.path).ok() == std::fs::canonicalize(&own).ok() {
+        return Err(ApiError::invalid("a space cannot push to itself"));
+    }
+    let from = request.from.clone();
+    let mut pending = with_space(&state, move |space, _| {
+        let head = head(space, &from)?;
+        Ok(space.start_push(head)?)
+    })
+    .await?;
+    let head = pending.head();
+    loop {
+        let ask = pending.to_ask();
+        if ask.is_empty() {
+            break;
+        }
+        let ids: Vec<String> = ask.iter().map(ToString::to_string).collect();
+        let answers = remote.have(&ids).await?;
+        pending = with_space(&state, move |space, _| {
+            space.answer_push(&mut pending, &answers)?;
+            Ok(pending)
+        })
+        .await?;
+    }
+    let order = with_space(&state, move |space, _| Ok(space.push_order(&pending)?)).await?;
+    let objects = u64::try_from(order.len()).unwrap_or(u64::MAX);
+    let mut bytes = 0;
+    for batch in order.chunks(FETCH_BATCH) {
+        let batch = batch.to_vec();
+        let (encoded, size) = with_space(&state, move |space, _| {
+            let mut raw = Vec::with_capacity(batch.len());
+            for id in batch {
+                raw.push(space.raw_object(id)?.ok_or_else(|| {
+                    ApiError::internal(&format!("{id} is referenced but missing here"))
+                })?);
+            }
+            let size: usize = raw.iter().map(|object| object.bytes.len()).sum();
+            Ok((encode_objects(&raw), size))
+        })
+        .await?;
+        bytes += u64::try_from(size).unwrap_or(u64::MAX);
+        remote.receive_objects(encoded.into()).await?;
+    }
+    let (host, branch) = (info.host.clone(), request.branch.clone());
+    let tracked = with_space(&state, move |space, _| {
+        Ok(space.resolve(&format!("{host}/{branch}"))?)
+    })
+    .await?;
+    let expected = match tracked {
+        Some(seen) => Some(seen.to_string()),
+        None => remote
+            .branches()
+            .await?
+            .into_iter()
+            .find(|found| found.name == request.branch)
+            .map(|found| found.head),
+    };
+    let new = head.to_string();
+    if let Err(error) = remote
+        .advance(&request.branch, expected.as_deref(), &new)
+        .await
+    {
+        return Err(if error.code() == Some("conflict") {
+            ApiError {
+                status: StatusCode::CONFLICT,
+                code: "conflict",
+                message: format!(
+                    "{error}; pull {host}/{branch}, merge it, and push again",
+                    host = info.host,
+                    branch = request.branch
+                ),
+            }
+        } else {
+            error.into()
+        });
+    }
+    let (host, branch) = (info.host.clone(), request.branch.clone());
+    with_space(&state, move |space, _| {
+        Ok(space.record_tracking(&host, &branch, head)?)
+    })
+    .await?;
+    Ok(Json(PushResponse {
+        remote: info.host,
+        branch: request.branch,
+        head: new,
+        objects,
+        bytes,
+    }))
+}
+
+async fn merge(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    body: Result<Json<MergeRequest>, JsonRejection>,
+) -> ApiResult<Json<MergeResponse>> {
+    let Json(request) = body?;
+    with_space(&state, move |space, host| {
+        let mut workspace = space.workspace(&name)?;
+        let author = author(host, request.caller);
+        let response = match space.merge_into_workspace(&mut workspace, &request.from, &author)? {
+            MergeOutcome::UpToDate => MergeResponse::UpToDate,
+            MergeOutcome::FastForward { commit } => MergeResponse::FastForward {
+                commit: commit.to_string(),
+            },
+            MergeOutcome::Merged { commit } => MergeResponse::Merged {
+                commit: commit.to_string(),
+            },
+            MergeOutcome::Conflicted(conflicts) => MergeResponse::Conflicted {
+                conflicts: conflict_infos(conflicts),
+            },
+            other => return Err(ApiError::internal(&format!("{other:?}"))),
+        };
+        Ok(Json(response))
     })
     .await
 }

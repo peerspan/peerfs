@@ -85,7 +85,11 @@ pub enum Error {
     #[error("workspace {0} exists already")]
     WorkspaceExists(String),
     /// A branch moved between reading it and updating it.
-    #[error("branch {branch} moved: expected {expected:?}, found {found:?}")]
+    #[error(
+        "branch {branch} moved: expected {}, found {}",
+        show_head(expected.as_ref()),
+        show_head(found.as_ref())
+    )]
     BranchMoved {
         /// The branch.
         branch: String,
@@ -113,6 +117,17 @@ pub enum Error {
         /// Why.
         reason: &'static str,
     },
+    /// A workspace has uncommitted changes or an unfinished merge, so it cannot merge.
+    #[error("workspace {0} has uncommitted changes or an unfinished merge")]
+    WorkspaceNotClean(String),
+    /// A branch would move to a commit whose history does not hold its current head.
+    #[error("branch {branch} cannot move to {new}: it does not contain the branch's head")]
+    NotFastForward {
+        /// The branch.
+        branch: String,
+        /// The commit it would move to.
+        new: ObjectId,
+    },
     /// Another host could not be reached or answered something unusable.
     #[error("remote: {0}")]
     Remote(String),
@@ -134,6 +149,11 @@ impl Error {
             source,
         }
     }
+}
+
+/// A branch head for a message: the id, or `none` for a branch that does not exist.
+fn show_head(head: Option<&ObjectId>) -> String {
+    head.map_or_else(|| "none".to_owned(), ToString::to_string)
 }
 
 /// The result of a space operation.

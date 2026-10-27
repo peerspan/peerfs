@@ -44,8 +44,8 @@ pub use object::{
     Author, ChangeId, Commit, Content, Entry, FileMode, InvalidNameError, Kind, Name, Tree,
 };
 pub use path::TreePath;
-pub use space::{CommitOutcome, DEFAULT_BRANCH, Merged, Space};
+pub use space::{CommitOutcome, DEFAULT_BRANCH, MergeOutcome, Merged, Space};
 pub use sync::{
-    FETCH_BATCH, Pull, Pulled, RawObject, Remote, Tracking, decode_objects, encode_objects,
+    FETCH_BATCH, Pull, Pulled, Push, RawObject, Remote, Tracking, decode_objects, encode_objects,
 };
 pub use workspace::{Change, EntryKind, Workspace};

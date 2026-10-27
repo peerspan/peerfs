@@ -9,7 +9,7 @@ selectively is the broader one.
 
 The design and its agreed decisions are in `peerspan/docs-internal`, `docs/peerfs.md`.
 
-## Status: milestones 1 and 2, and slice 1 of 3a (pulling between spaces)
+## Status: milestones 1 and 2, and slices 1 and 2 of 3a (pull, push and merge between spaces)
 
 What works today, on one host:
 
@@ -23,9 +23,11 @@ What works today, on one host:
 | Workspaces | A writable overlay over a commit; every write synced before it returns | 3, 4 |
 | Commit | Fast path when the branch has not moved; otherwise a three-way merge onto the new head. Text up to 1 MiB merges by line; a conflict commits nothing and leaves markers in the workspace to resolve | 2 |
 | Pull | Fetches another space's branch and its whole history, only the objects missing here, each checked against its identity and expected kind; records it as the tracking reference `<host>/<branch>`. The store stays closed (it holds an object only with everything it references), so an interrupted pull leaves no reference and resumes. Between spaces on one host for now; across hosts through the daemons in 3b | 3, 8 |
+| Push | Sends a branch to the space that holds it: asks which objects it lacks (a held object needs nothing beneath it sent), sends those children first, and the receiver refuses any object that does not match or references one it lacks. The home host moves its branch only by compare-and-swap against the head the pusher last pulled, and only as a fast-forward, so a push never drops commits it did not see | 2, 3 |
+| Merge | `ws merge` brings a branch or `<host>/<branch>` into a workspace's branch: up to date, fast-forward, a clean merge commit with both parents, or conflict markers to resolve, after which the commit records both parents. A refused push is followed by pull, merge, push | 2 |
 | Server | `peerfs serve` owns the space and serves it at `<space>/peerfs.sock`, so concurrent agents serialize through it; it exits after an idle timeout, on SIGTERM and on `peerfs stop` | 4 |
 | API | HTTP/1.1 and JSON over the Unix socket, following the host daemon's `admin.sock` conventions; a Rust client in `peerfs-api` | 4, 9 |
-| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `pull`, `remotes`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / discard` | 4 |
+| CLI | A client of the server, starting one in the background when none answers: `peerfs init`, `serve`, `stop`, `import`, `pull`, `push`, `remotes`, `export`, `branches`, `fork`, `log`, and `peerfs ws create / read / write / rm / ls / status / commit / merge / discard` | 4 |
 
 Not yet: signing, replication between hosts and durability receipts, owner rules for
 conflicts (`regenerate`, `ours`/`theirs`, structured merge), source/derived/secret path
@@ -58,6 +60,11 @@ the request names.
 | `POST /v1/objects/fetch` | Objects by id (`{ids}`, at most 256), as `application/octet-stream`; those not held are left out |
 | `POST /v1/pull` | Pull a branch from another server (`{from, branch}`, `from` its socket); the space is held only between fetches |
 | `GET /v1/remotes` | Tracking references, with when each was pulled |
+| `POST /v1/objects/have` | Which of these objects (`{ids}`, at most 256) the space holds |
+| `POST /v1/objects/receive` | Store objects (`application/octet-stream`), each after everything it references |
+| `POST /v1/branches/{name}/advance` | Move a branch (`{expected, new}`) by compare-and-swap, fast-forward only |
+| `POST /v1/push` | Send a local revision to another server (`{to, branch, from}`) and advance its branch; `conflict` if it moved |
+| `POST /v1/workspaces/{name}/merge` | Merge a revision (`{from, caller}`); the outcome is `up_to_date`, `fast_forward`, `merged` or `conflicted` |
 
 ## Try it
 
@@ -83,7 +90,7 @@ peerfs ws read agent-2 notes.txt
 | `crates/peerfs-server` | The server: one space behind the API |
 | `crates/peerfs` | The command-line interface, a client of the server |
 
-A space on disk is `FORMAT`, `objects/pack-*.pack`, `refs/branches/<name>`, and
+A space on disk is `FORMAT`, `HOST` (the host given at `init`), `objects/pack-*.pack`, `refs/branches/<name>`, `refs/remotes/<host>/<branch>`, and
 `workspaces/<name>/` (`state`, `whiteouts`, `upper/`), and while a server runs,
 `peerfs.sock`, `serve.pid` and its log `serve.log`.
 

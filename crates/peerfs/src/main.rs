@@ -15,9 +15,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use peerfs_api::{Caller, ChangeInfo, Client, ClientError, CommitResponse, EntryKind, Revision};
+use peerfs_api::{
+    Caller, ChangeInfo, Client, ClientError, CommitResponse, EntryKind, MergeResponse, Revision,
+};
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
+
+/// The file in a space naming the host its server records on commits.
+const HOST_FILE: &str = "HOST";
 
 /// How long a server started by a command waits for the next request before exiting.
 const AUTOSTART_IDLE: Duration = Duration::from_secs(600);
@@ -31,8 +36,9 @@ struct Cli {
     /// The space's directory.
     #[arg(long, env = "PEERFS_SPACE", global = true, default_value = ".peerfs")]
     space: PathBuf,
-    /// The host recorded on commits; defaults to this machine's hostname. Only `init` and
-    /// a server being started use it: a running server records its own.
+    /// The host recorded on commits. `init` saves it in the space's `HOST` file, which a
+    /// server uses when this is not given; without either, this machine's hostname. A
+    /// running server records its own.
     #[arg(long, env = "PEERFS_HOST", global = true)]
     host: Option<String>,
     /// The agent recorded on commits.
@@ -87,6 +93,18 @@ enum Command {
     },
     /// List branches pulled from other hosts, as of their last pull.
     Remotes,
+    /// Send a branch to another space and move its branch there. Refused if that branch
+    /// moved since the last pull: pull, `ws merge`, and push again.
+    Push {
+        /// The other space's directory, on this host.
+        to: PathBuf,
+        /// The branch there.
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// The local branch to send; defaults to `--branch`.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Create a branch at another branch's head. Copies no data.
     Fork {
         /// The new branch.
@@ -142,6 +160,8 @@ enum WorkspaceCommand {
         #[arg(short, long)]
         message: String,
     },
+    /// Merge a branch, or `<host>/<branch>`, into the branch the workspace follows.
+    Merge { name: String, revision: String },
     /// Delete a workspace and its uncommitted changes.
     Discard { name: String },
 }
@@ -167,9 +187,19 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    let host = cli.host.clone().unwrap_or_else(hostname);
     let space_dir = std::path::absolute(&cli.space)
         .with_context(|| format!("resolving {}", cli.space.display()))?;
+    // The host a space was created with, unless `--host` says otherwise.
+    let host = cli
+        .host
+        .clone()
+        .or_else(|| {
+            fs::read_to_string(space_dir.join(HOST_FILE))
+                .ok()
+                .map(|text| text.trim().to_owned())
+                .filter(|host| !host.is_empty())
+        })
+        .unwrap_or_else(hostname);
     match cli.command {
         Command::Init => {
             let author = Author {
@@ -179,6 +209,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             };
             Space::init(&space_dir, &author)
                 .with_context(|| format!("creating a space in {}", space_dir.display()))?;
+            let host_file = space_dir.join(HOST_FILE);
+            fs::write(&host_file, format!("{}\n", author.host))
+                .with_context(|| format!("writing {}", host_file.display()))?;
             writeln!(io::stdout().lock(), "created {}", space_dir.display())?;
             Ok(ExitCode::SUCCESS)
         }
@@ -322,22 +355,10 @@ async fn client_command(
                 writeln!(out, "{} {}", branch.head, branch.name)?;
             }
         }
-        Command::Pull { from, branch } => {
-            let from = std::path::absolute(&from)
-                .with_context(|| format!("resolving {}", from.display()))?;
-            // The other space's server answers the pull; start it if it is not running.
-            let other = connect(&from, None).await?;
-            let socket = other
-                .socket()
-                .to_str()
-                .with_context(|| format!("{} is not UTF-8", from.display()))?
-                .to_owned();
-            let pulled = client.pull(&socket, &branch).await?;
-            writeln!(
-                out,
-                "{} {}/{} ({} objects, {} bytes fetched)",
-                pulled.head, pulled.remote, pulled.branch, pulled.objects, pulled.bytes
-            )?;
+        Command::Pull { from, branch } => return pull(client, &from, &branch, out).await,
+        Command::Push { to, branch, from } => {
+            let from = from.unwrap_or_else(|| branch.clone());
+            return push(client, &to, &branch, &from, out).await;
         }
         Command::Remotes => {
             for tracking in client.remotes().await? {
@@ -454,7 +475,77 @@ async fn workspace(
                 }
             }
         }
+        WorkspaceCommand::Merge { name, revision } => {
+            match client.merge(&name, &revision, caller).await? {
+                MergeResponse::UpToDate => writeln!(out, "already up to date")?,
+                MergeResponse::FastForward { commit } => {
+                    writeln!(out, "{commit} (fast-forward)")?;
+                }
+                MergeResponse::Merged { commit } => writeln!(out, "{commit} (merged)")?,
+                MergeResponse::Conflicted { conflicts } => {
+                    for conflict in &conflicts {
+                        writeln!(out, "conflict: {}: {}", conflict.path, conflict.kind)?;
+                    }
+                    writeln!(
+                        out,
+                        "nothing committed; resolve the conflicts in {name} and commit to finish \
+                         the merge"
+                    )?;
+                    return Ok(ExitCode::from(1));
+                }
+            }
+        }
         WorkspaceCommand::Discard { name } => client.discard(&name).await?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The socket of the space in `dir`, starting its server if it is not running.
+async fn other_socket(dir: &Path) -> Result<String> {
+    let dir = std::path::absolute(dir).with_context(|| format!("resolving {}", dir.display()))?;
+    let other = connect(&dir, None).await?;
+    Ok(other
+        .socket()
+        .to_str()
+        .with_context(|| format!("{} is not UTF-8", dir.display()))?
+        .to_owned())
+}
+
+async fn pull(
+    client: &Client,
+    from: &Path,
+    branch: &str,
+    out: &mut impl Write,
+) -> Result<ExitCode> {
+    let pulled = client.pull(&other_socket(from).await?, branch).await?;
+    writeln!(
+        out,
+        "{} {}/{} ({} objects, {} bytes fetched)",
+        pulled.head, pulled.remote, pulled.branch, pulled.objects, pulled.bytes
+    )?;
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn push(
+    client: &Client,
+    to: &Path,
+    branch: &str,
+    from: &str,
+    out: &mut impl Write,
+) -> Result<ExitCode> {
+    match client.push(&other_socket(to).await?, branch, from).await {
+        Ok(pushed) => {
+            writeln!(
+                out,
+                "{} {}/{} ({} objects, {} bytes sent)",
+                pushed.head, pushed.remote, pushed.branch, pushed.objects, pushed.bytes
+            )?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) if error.code() == Some("conflict") => {
+            writeln!(out, "refused: {error}")?;
+            Ok(ExitCode::from(1))
+        }
+        Err(error) => Err(error.into()),
+    }
 }

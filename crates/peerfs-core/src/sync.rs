@@ -291,42 +291,178 @@ fn store_children_first(
     pending: &mut HashMap<ObjectId, Pending>,
     store: &mut Store,
 ) -> Result<()> {
+    let order = children_first(discovered, |id| {
+        pending.get(id).map(|object| object.references.as_slice())
+    });
+    for id in order {
+        if let Some(object) = pending.remove(&id) {
+            store.put(object.kind, &object.bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Orders `discovered` and the objects they reach among themselves so that each comes after
+/// everything it references. `references` gives an object's references, or `None` for an
+/// object outside the set.
+fn children_first<'refs>(
+    discovered: &[ObjectId],
+    references: impl Fn(&ObjectId) -> Option<&'refs [ObjectId]>,
+) -> Vec<ObjectId> {
+    let mut order = Vec::with_capacity(discovered.len());
     let mut visited: HashSet<ObjectId> = HashSet::new();
     for root in discovered {
         if !visited.insert(*root) {
             continue;
         }
-        // Each frame is an object and whether its references have been pushed.
         let mut stack = vec![(*root, Visit::Enter)];
         while let Some((id, visit)) = stack.pop() {
             match visit {
                 Visit::Enter => {
                     stack.push((id, Visit::Leave));
-                    let children = pending
-                        .get(&id)
-                        .map(|object| object.references.clone())
-                        .unwrap_or_default();
-                    for child in children {
-                        if pending.contains_key(&child) && visited.insert(child) {
-                            stack.push((child, Visit::Enter));
+                    for child in references(&id).unwrap_or_default() {
+                        if references(child).is_some() && visited.insert(*child) {
+                            stack.push((*child, Visit::Enter));
                         }
                     }
                 }
-                Visit::Leave => {
-                    if let Some(object) = pending.remove(&id) {
-                        store.put(object.kind, &object.bytes)?;
-                    }
-                }
+                Visit::Leave => order.push(id),
             }
         }
     }
-    Ok(())
+    order
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Visit {
     Enter,
     Leave,
+}
+
+/// A push in progress: which objects to ask the receiver about, and which it lacks.
+///
+/// Like [`Pull`], it borrows no space between steps. Ask the receiver which of
+/// [`Push::to_ask`] it holds, give the answers to [`Space::answer_push`](crate::Space::answer_push),
+/// and repeat until nothing is left to ask; then send [`Space::push_order`](crate::Space::push_order)'s
+/// objects in that order. The receiver's store being closed, an object it holds needs
+/// nothing beneath it sent.
+#[derive(Debug)]
+pub struct Push {
+    head: ObjectId,
+    queue: VecDeque<ObjectId>,
+    asked: Vec<ObjectId>,
+    seen: HashSet<ObjectId>,
+    missing: Vec<ObjectId>,
+    references: HashMap<ObjectId, Vec<ObjectId>>,
+}
+
+impl Push {
+    pub(crate) fn new(head: ObjectId) -> Self {
+        Self {
+            head,
+            queue: VecDeque::from([head]),
+            asked: Vec::new(),
+            seen: HashSet::from([head]),
+            missing: Vec::new(),
+            references: HashMap::new(),
+        }
+    }
+
+    /// The commit being pushed.
+    pub fn head(&self) -> ObjectId {
+        self.head
+    }
+
+    /// The next objects to ask the receiver about, at most [`FETCH_BATCH`]; empty when every
+    /// missing object is known.
+    pub fn to_ask(&mut self) -> Vec<ObjectId> {
+        if self.asked.is_empty() {
+            let take = self.queue.len().min(FETCH_BATCH);
+            self.asked = self.queue.drain(..take).collect();
+        }
+        self.asked.clone()
+    }
+
+    pub(crate) fn answer(&mut self, store: &Store, held: &[bool]) -> Result<()> {
+        let asked = std::mem::take(&mut self.asked);
+        if held.len() != asked.len() {
+            return Err(Error::Remote(format!(
+                "asked about {} objects, answered {}",
+                asked.len(),
+                held.len()
+            )));
+        }
+        for (id, held) in asked.into_iter().zip(held) {
+            if *held {
+                continue;
+            }
+            let (kind, bytes) = store.get(&id)?.ok_or(Error::Corrupt(format!(
+                "{id} is referenced but missing here"
+            )))?;
+            let children: Vec<ObjectId> = references(id, kind, &bytes)?
+                .into_iter()
+                .map(|(child, _)| child)
+                .collect();
+            for child in &children {
+                if self.seen.insert(*child) {
+                    self.queue.push_back(*child);
+                }
+            }
+            self.missing.push(id);
+            self.references.insert(id, children);
+        }
+        Ok(())
+    }
+
+    /// The objects the receiver lacks, each after everything it references.
+    pub(crate) fn order(&self) -> Result<Vec<ObjectId>> {
+        if !self.queue.is_empty() || !self.asked.is_empty() {
+            return Err(Error::Remote(
+                "the push was ordered before it was complete".to_owned(),
+            ));
+        }
+        Ok(children_first(&self.missing, |id| {
+            self.references.get(id).map(Vec::as_slice)
+        }))
+    }
+}
+
+/// Stores objects another host sent, in order, refusing any that does not match its
+/// identity or references an object not yet held, so the store stays closed.
+pub(crate) fn accept_objects(store: &mut Store, objects: &[RawObject]) -> Result<u64> {
+    let mut stored = 0;
+    for object in objects {
+        if ObjectId::compute(object.kind, &object.bytes) != object.id {
+            return Err(Error::RemoteObject {
+                id: object.id,
+                problem: "does not match its identity",
+            });
+        }
+        if store.contains(&object.id) {
+            continue;
+        }
+        for (child, kind) in references(object.id, object.kind, &object.bytes)? {
+            match store.kind_of(&child) {
+                Some(found) if found == kind => {}
+                Some(_) => {
+                    return Err(Error::RemoteObject {
+                        id: object.id,
+                        problem: "references an object of the wrong kind",
+                    });
+                }
+                None => {
+                    return Err(Error::RemoteObject {
+                        id: object.id,
+                        problem: "references an object this space does not hold",
+                    });
+                }
+            }
+        }
+        store.put(object.kind, &object.bytes)?;
+        stored += 1;
+    }
+    store.sync()?;
+    Ok(stored)
 }
 
 /// Tracking references: `refs/remotes/<remote>/<branch>`, holding a head and the time of
