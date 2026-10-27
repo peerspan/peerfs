@@ -154,6 +154,16 @@ pub enum Error {
     /// A commit could not be signed.
     #[error("signing: {0}")]
     Signing(String),
+    /// Something exists at a path already.
+    #[error("{0} exists already")]
+    Exists(String),
+    /// A directory still has entries.
+    #[error("directory {0} is not empty")]
+    NotEmpty(String),
+    /// A directory holding committed content cannot be renamed in place; copy it and
+    /// remove the original instead, as overlay file systems require.
+    #[error("cannot rename directory {0}: it holds committed content")]
+    DirectoryRename(String),
     /// A host name is empty or holds whitespace.
     #[error("invalid host {0:?}")]
     InvalidHost(String),

@@ -295,3 +295,52 @@ fn ws_snapshot_prints_each_snapshot_and_commit_replaces_them() {
     );
     assert_eq!(run(&["ws", "snapshots", "w"], None), "");
 }
+
+#[test]
+fn a_mounted_workspace_is_edited_as_a_directory_and_committed() {
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .is_err()
+    {
+        return; // This machine cannot mount FUSE file systems.
+    }
+    let space = new_space();
+    let run = |args: &[&str]| ok(&peerfs(&space.path, "a", args, None));
+    let mountpoint = space.path.parent().expect("parent").join("mnt");
+    std::fs::create_dir(&mountpoint).expect("mountpoint");
+    let mnt = mountpoint.to_str().expect("UTF-8");
+
+    run(&["ws", "create", "w"]);
+    assert!(run(&["ws", "mount", "w", mnt]).contains("w mounted at"));
+    assert_eq!(run(&["mounts"]), format!("w {mnt}\n"));
+
+    std::fs::create_dir(mountpoint.join("src")).expect("mkdir");
+    std::fs::write(mountpoint.join("src/main.rs"), "fn main() {}\n").expect("write");
+    assert_eq!(run(&["ws", "status", "w"]).trim(), "M src/main.rs");
+    run(&["ws", "commit", "w", "-m", "From the mount"]);
+    assert_eq!(
+        std::fs::read_to_string(mountpoint.join("src/main.rs")).expect("read"),
+        "fn main() {}\n",
+        "still there, now from the store"
+    );
+    assert!(run(&["log", "-n", "1"]).contains("From the mount"));
+
+    let discard = peerfs(&space.path, "a", &["ws", "discard", "w"], None);
+    assert!(
+        !discard.status.success(),
+        "a mounted workspace is not discarded"
+    );
+    let import = peerfs(&space.path, "a", &["import", mnt], None);
+    assert!(!import.status.success(), "the server would wait on itself");
+
+    run(&["ws", "unmount", "w"]);
+    assert_eq!(run(&["mounts"]), "");
+    assert!(
+        std::fs::read_dir(&mountpoint)
+            .expect("listing")
+            .next()
+            .is_none()
+    );
+}

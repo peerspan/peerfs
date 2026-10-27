@@ -1,0 +1,18 @@
+[package]
+name = "peerfs-mount"
+description = "A peerfs workspace as a FUSE file system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+fuse-backend-rs.workspace = true
+libc.workspace = true
+peerfs-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

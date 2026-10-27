@@ -53,4 +53,4 @@ pub use space::{CommitOutcome, DEFAULT_BRANCH, MergeOutcome, Merged, Space};
 pub use sync::{
     FETCH_BATCH, Pull, Pulled, Push, RawObject, Remote, Tracking, decode_objects, encode_objects,
 };
-pub use workspace::{Change, EntryKind, Workspace};
+pub use workspace::{Change, EntryKind, Located, NewEntry, Workspace};

@@ -10,6 +10,7 @@ publish.workspace = true
 axum.workspace = true
 peerfs-api.workspace = true
 peerfs-core.workspace = true
+peerfs-mount.workspace = true
 serde.workspace = true
 tokio.workspace = true
 

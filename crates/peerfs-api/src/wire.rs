@@ -156,6 +156,18 @@ pub struct WorkspaceInfo {
     pub snapshot: Option<String>,
 }
 
+/// `POST /v1/workspaces/{name}/mount`: mount the workspace at a directory, and an entry
+/// of `GET /v1/mounts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MountInfo {
+    /// The workspace; filled in by the server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace: String,
+    /// The directory, absolute, on the server's host; empty before mounting.
+    pub path: String,
+}
+
 /// `POST /v1/workspaces`: create a workspace following a branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -4,6 +4,7 @@
 //! here instead of contending for the space's lock. The routes and bodies are those of
 //! [`peerfs_api`].
 
+use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use peerfs_api::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest,
     CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
     ExportRequest, FetchRequest, ForkRequest, HaveRequest, HaveResponse, HostKey, ImportRequest,
-    MergeRequest, MergeResponse, PullRequest, PullResponse, PushRequest, PushResponse,
+    MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
     ReceiveResponse, Revision, SOCKET_NAME, SnapshotRequest, SnapshotResponse, SpaceInfo,
     TrackingInfo, WorkspaceInfo,
 };
@@ -32,6 +33,7 @@ use peerfs_core::{
     Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH,
     MergeOutcome, Merged, ObjectId, PublicKey, Space, Workspace, decode_objects, encode_objects,
 };
+use peerfs_mount::Mount;
 use serde::Deserialize;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
@@ -60,7 +62,9 @@ pub struct Options {
 
 #[derive(Debug)]
 struct Shared {
-    space: Mutex<Space>,
+    space: Arc<Mutex<Space>>,
+    /// Mounted workspaces, by name.
+    mounts: Mutex<BTreeMap<String, Mount>>,
     host: String,
     started: Instant,
     last_request_ms: AtomicU64,
@@ -81,7 +85,8 @@ pub fn pid_path(space_dir: &Path) -> PathBuf {
 /// The API's routes over `space`.
 pub fn router(space: Space, host: String) -> Router {
     router_with(Arc::new(Shared {
-        space: Mutex::new(space),
+        space: Arc::new(Mutex::new(space)),
+        mounts: Mutex::new(BTreeMap::new()),
         host,
         started: Instant::now(),
         last_request_ms: AtomicU64::new(0),
@@ -122,6 +127,11 @@ fn router_with(state: AppState) -> Router {
         .route("/v1/pull", post(pull))
         .route("/v1/remotes", get(remotes))
         .route("/v1/hosts", get(hosts).post(add_host))
+        .route(
+            "/v1/workspaces/{name}/mount",
+            post(mount_workspace).delete(unmount_workspace),
+        )
+        .route("/v1/mounts", get(mounts))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
@@ -152,7 +162,8 @@ pub async fn serve(space: Space, options: Options) -> io::Result<()> {
     let pid_file = pid_path(space.path());
     std::fs::write(&pid_file, format!("{}\n", std::process::id()))?;
     let state = Arc::new(Shared {
-        space: Mutex::new(space),
+        space: Arc::new(Mutex::new(space)),
+        mounts: Mutex::new(BTreeMap::new()),
         host: options.host,
         started: Instant::now(),
         last_request_ms: AtomicU64::new(0),
@@ -161,9 +172,15 @@ pub async fn serve(space: Space, options: Options) -> io::Result<()> {
     if let Some(timeout) = options.idle_timeout {
         tokio::spawn(watch_idle(Arc::clone(&state), timeout, Arc::clone(&stop)));
     }
-    let served = axum::serve(listener, router_with(state))
+    let served = axum::serve(listener, router_with(Arc::clone(&state)))
         .with_graceful_shutdown(shutdown(stop))
         .await;
+    let mounts = std::mem::take(&mut *lock_mounts(&state));
+    for (workspace, mount) in mounts {
+        if let Err(e) = mount.unmount() {
+            log_internal(&format!("unmounting workspace {workspace}: {e}"));
+        }
+    }
     let removed = std::fs::remove_file(&socket).and(std::fs::remove_file(&pid_file));
     served?;
     removed
@@ -174,6 +191,11 @@ async fn watch_idle(state: AppState, timeout: Duration, stop: Arc<Notify>) {
     loop {
         tokio::time::sleep(IDLE_CHECK.min(timeout)).await;
         let now = elapsed_ms(state.started);
+        if !lock_mounts(&state).is_empty() {
+            // A mount is served by this process, so it is in use however quiet the API is.
+            state.last_request_ms.store(now, Ordering::Relaxed);
+            continue;
+        }
         if now.saturating_sub(state.last_request_ms.load(Ordering::Relaxed)) >= timeout_ms {
             stop.notify_one();
             return;
@@ -226,6 +248,14 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code: "invalid",
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
             message: message.into(),
         }
     }
@@ -487,6 +517,7 @@ async fn import(
     body: Result<Json<ImportRequest>, JsonRejection>,
 ) -> ApiResult<Json<BranchInfo>> {
     let Json(request) = body?;
+    outside_mounts(&state, &request.source)?;
     with_space(&state, move |space, host| {
         let tree = space.import(absolute(&request.source)?)?;
         let commit = space.commit_tree(
@@ -508,6 +539,7 @@ async fn export(
     body: Result<Json<ExportRequest>, JsonRejection>,
 ) -> ApiResult<StatusCode> {
     let Json(request) = body?;
+    outside_mounts(&state, &request.target)?;
     with_space(&state, move |space, _| {
         let commit = match &request.from {
             Revision::Branch(branch) => head(space, branch)?,
@@ -559,6 +591,11 @@ async fn discard_workspace(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
 ) -> ApiResult<StatusCode> {
+    if lock_mounts(&state).contains_key(&name) {
+        return Err(ApiError::conflict(format!(
+            "workspace {name} is mounted; unmount it first"
+        )));
+    }
     with_space(&state, move |space, _| {
         space.discard_workspace(&name)?;
         Ok(StatusCode::NO_CONTENT)
@@ -873,6 +910,98 @@ async fn add_host(
         Ok((status, Json(request)))
     })
     .await
+}
+
+fn lock_mounts(state: &Shared) -> std::sync::MutexGuard<'_, BTreeMap<String, Mount>> {
+    state
+        .mounts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Refuses a path inside a mount: the server would wait on itself serving it.
+fn outside_mounts(state: &Shared, path: &str) -> ApiResult<()> {
+    let path = absolute(path)?;
+    let inside = lock_mounts(state)
+        .values()
+        .any(|mount| path.starts_with(mount.path()));
+    if inside {
+        return Err(ApiError::invalid(format!(
+            "{} is inside a mounted workspace; use the workspace instead",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn mount_workspace(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    body: Result<Json<MountInfo>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<MountInfo>)> {
+    let Json(request) = body?;
+    let path = absolute(&request.path)?.to_owned();
+    with_space(&state, {
+        let name = name.clone();
+        move |space, _| Ok(space.workspace(&name).map(drop)?)
+    })
+    .await?;
+    let shared = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        // Not under the space's lock: checking the directory could reach another mount.
+        let mut mounts = lock_mounts(&shared);
+        if let Some(mounted) = mounts.get(&name) {
+            return Err(ApiError::conflict(format!(
+                "workspace {name} is mounted at {} already",
+                mounted.path().display()
+            )));
+        }
+        let mount =
+            Mount::new(Arc::clone(&shared.space), &name, &path).map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound
+                | io::ErrorKind::DirectoryNotEmpty
+                | io::ErrorKind::NotADirectory => {
+                    ApiError::invalid(format!("{}: {e}", path.display()))
+                }
+                _ => ApiError::internal(&format!("mounting at {}: {e}", path.display())),
+            })?;
+        let info = MountInfo {
+            workspace: name.clone(),
+            path: mount.path().display().to_string(),
+        };
+        mounts.insert(name, mount);
+        Ok((StatusCode::CREATED, Json(info)))
+    })
+    .await
+    .map_err(|e| ApiError::internal(&e))?
+}
+
+async fn unmount_workspace(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> ApiResult<StatusCode> {
+    let Some(mount) = lock_mounts(&state).remove(&name) else {
+        return Err(ApiError::not_found(format!(
+            "workspace {name} is not mounted"
+        )));
+    };
+    tokio::task::spawn_blocking(move || mount.unmount())
+        .await
+        .map_err(|e| ApiError::internal(&e))?
+        .map_err(|e| ApiError::internal(&format!("unmounting {name}: {e}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn mounts(State(state): State<AppState>) -> ApiResult<Json<Vec<MountInfo>>> {
+    Ok(Json(
+        lock_mounts(&state)
+            .iter()
+            .map(|(workspace, mount)| MountInfo {
+                workspace: workspace.clone(),
+                path: mount.path().display().to_string(),
+            })
+            .collect(),
+    ))
 }
 
 async fn remotes(State(state): State<AppState>) -> ApiResult<Json<Vec<TrackingInfo>>> {

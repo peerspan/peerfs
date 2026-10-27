@@ -38,6 +38,30 @@ impl EntryKind {
     }
 }
 
+/// Where a path's entry is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    /// In the overlay: a real file, link or directory at this local path. A directory here
+    /// may also have entries from the base.
+    Local(PathBuf),
+    /// Only in the base commit.
+    Base(Entry),
+}
+
+/// An entry to create in a workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewEntry<'target> {
+    /// An empty regular file.
+    File {
+        /// Whether it is executable.
+        executable: bool,
+    },
+    /// An empty directory.
+    Directory,
+    /// A symbolic link to this target.
+    Symlink(&'target str),
+}
+
 /// An uncommitted change in a workspace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Change {
@@ -326,7 +350,181 @@ impl Workspace {
     ///
     /// Fails if nothing is there or on a file system error.
     pub fn remove(&mut self, space: &Space, path: &str) -> Result<()> {
-        let tree_path = TreePath::try_from(path)?;
+        self.remove_at(space, &TreePath::try_from(path)?)
+    }
+
+    /// Where the entry at `path` is, if anything is there.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a store error.
+    pub fn locate(&self, space: &Space, path: &TreePath) -> Result<Option<Located>> {
+        let local = self.upper_path(path);
+        if fs::symlink_metadata(&local).is_ok() {
+            return Ok(Some(Located::Local(local)));
+        }
+        Ok(self.base_entry(space, path)?.map(Located::Base))
+    }
+
+    /// Brings the entry at `path` into the overlay, if it is only in the base, and returns
+    /// its local path. A directory is created empty; its base entries stay visible.
+    ///
+    /// The copy is not synced: like any write through a mount, it is durable once synced.
+    ///
+    /// # Errors
+    ///
+    /// Fails if nothing is there, or on a store or file system error.
+    pub fn copy_up(&mut self, space: &Space, path: &TreePath) -> Result<PathBuf> {
+        let local = self.upper_path(path);
+        if fs::symlink_metadata(&local).is_ok() {
+            return Ok(local);
+        }
+        let entry = self
+            .base_entry(space, path)?
+            .ok_or_else(|| Error::NotFound(path.to_string()))?;
+        if let Some((parent, _)) = path.split_last() {
+            make_dirs(&self.upper_path(&parent))?;
+        }
+        match entry {
+            Entry::File { content, mode } => {
+                fs::write(&local, space.read_content(&content)?)
+                    .and_then(|()| {
+                        fs::set_permissions(&local, fs::Permissions::from_mode(permissions(mode)))
+                    })
+                    .map_err(|e| Error::io("copying up", &local, e))?;
+            }
+            Entry::Symlink(target) => {
+                symlink(target, &local).map_err(|e| Error::io("copying up", &local, e))?;
+            }
+            Entry::Tree(_) => make_dirs(&local)?,
+        }
+        Ok(local)
+    }
+
+    /// Creates an empty file, an empty directory or a link at `path`, in a directory that
+    /// exists, and returns its local path.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::Exists`] if something is there, [`Error::NotFound`] if its
+    /// directory is missing, or on a file system error.
+    pub fn create_entry(
+        &mut self,
+        space: &Space,
+        path: &TreePath,
+        new: NewEntry<'_>,
+    ) -> Result<PathBuf> {
+        let Some((parent, _)) = path.split_last() else {
+            return Err(Error::Exists(path.to_string()));
+        };
+        if self.locate(space, path)?.is_some() {
+            return Err(Error::Exists(path.to_string()));
+        }
+        match self.locate(space, &parent)? {
+            Some(Located::Base(Entry::Tree(_))) => make_dirs(&self.upper_path(&parent))?,
+            Some(Located::Local(local)) if local.is_dir() => {}
+            Some(_) => {
+                return Err(Error::WrongEntry {
+                    path: parent.to_string(),
+                    found: "file",
+                });
+            }
+            None => return Err(Error::NotFound(parent.to_string())),
+        }
+        let local = self.upper_path(path);
+        let created = match new {
+            NewEntry::File { executable } => File::create_new(&local).and_then(|file| {
+                let mode = if executable {
+                    FileMode::Executable
+                } else {
+                    FileMode::Regular
+                };
+                file.set_permissions(fs::Permissions::from_mode(permissions(mode)))
+            }),
+            NewEntry::Directory => fs::create_dir(&local),
+            NewEntry::Symlink(target) => symlink(target, &local),
+        };
+        created.map_err(|e| Error::io("creating", &local, e))?;
+        Ok(local)
+    }
+
+    /// Removes the empty directory at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::NotEmpty`] if it has entries, or if it is missing or not a
+    /// directory.
+    pub fn remove_dir(&mut self, space: &Space, path: &TreePath) -> Result<()> {
+        if !self.list(space, &path.to_string())?.is_empty() {
+            return Err(Error::NotEmpty(path.to_string()));
+        }
+        self.remove_at(space, path)
+    }
+
+    /// Moves the entry at `from` to `to`, replacing a file or empty directory there.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::DirectoryRename`] for a directory that holds base content,
+    /// [`Error::NotEmpty`] when `to` is a directory with entries, [`Error::WrongEntry`]
+    /// when a file would replace a directory or the reverse, or [`Error::NotFound`].
+    pub fn rename(&mut self, space: &Space, from: &TreePath, to: &TreePath) -> Result<()> {
+        if from == to {
+            return Ok(());
+        }
+        let source = self
+            .locate(space, from)?
+            .ok_or_else(|| Error::NotFound(from.to_string()))?;
+        let from_in_base = self.base_entry(space, from)?.is_some();
+        let source_is_dir = match &source {
+            Located::Local(local) => local.is_dir() && !local.is_symlink(),
+            Located::Base(entry) => matches!(entry, Entry::Tree(_)),
+        };
+        if source_is_dir && from_in_base {
+            return Err(Error::DirectoryRename(from.to_string()));
+        }
+        let Some((to_parent, _)) = to.split_last() else {
+            return Err(Error::Exists(to.to_string()));
+        };
+        if let Some(existing) = self.locate(space, to)? {
+            let existing_is_dir = match &existing {
+                Located::Local(local) => local.is_dir() && !local.is_symlink(),
+                Located::Base(entry) => matches!(entry, Entry::Tree(_)),
+            };
+            match (source_is_dir, existing_is_dir) {
+                (false, true) => {
+                    return Err(Error::WrongEntry {
+                        path: to.to_string(),
+                        found: "directory",
+                    });
+                }
+                (true, false) => {
+                    return Err(Error::WrongEntry {
+                        path: to.to_string(),
+                        found: "file",
+                    });
+                }
+                (true, true) => self.remove_dir(space, to)?,
+                (false, false) => self.remove_at(space, to)?,
+            }
+        }
+        let local_from = self.copy_up(space, from)?;
+        match self.locate(space, &to_parent)? {
+            Some(Located::Base(Entry::Tree(_))) => make_dirs(&self.upper_path(&to_parent))?,
+            Some(Located::Local(local)) if local.is_dir() => {}
+            _ => return Err(Error::NotFound(to_parent.to_string())),
+        }
+        let local_to = self.upper_path(to);
+        fs::rename(&local_from, &local_to).map_err(|e| Error::io("renaming", &local_from, e))?;
+        if from_in_base {
+            self.whiteouts.insert(from.clone());
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn remove_at(&mut self, space: &Space, tree_path: &TreePath) -> Result<()> {
+        let tree_path = tree_path.clone();
         let local = self.upper_path(&tree_path);
         let in_upper = match fs::symlink_metadata(&local) {
             Ok(meta) => {
@@ -405,8 +603,10 @@ impl Workspace {
     /// Fails on a file system error.
     pub fn changes(&self) -> Result<Vec<Change>> {
         let mut changes = Vec::new();
-        walk_upper(&upper(&self.dir), &TreePath::root(), &mut |path, _| {
-            changes.push(Change::Written(path));
+        walk_upper(&upper(&self.dir), &TreePath::root(), &mut |path, local| {
+            if !local.is_dir() {
+                changes.push(Change::Written(path));
+            }
             Ok(())
         })?;
         changes.extend(self.whiteouts.iter().cloned().map(Change::Removed));
@@ -426,7 +626,14 @@ impl Workspace {
         })?;
         for (path, local) in written {
             let meta = fs::symlink_metadata(&local).map_err(|e| Error::io("reading", &local, e))?;
-            let entry = if meta.is_symlink() {
+            let entry = if meta.is_dir() {
+                // An empty directory of the overlay. One the base shows here is only the
+                // parent of a removed or copied-up entry, so it changes nothing.
+                if self.base_entry(space, &path)?.is_some() {
+                    continue;
+                }
+                Entry::Tree(space.put_tree(&Tree::new())?)
+            } else if meta.is_symlink() {
                 let target = fs::read_link(&local).map_err(|e| Error::io("reading", &local, e))?;
                 Entry::Symlink(target.to_string_lossy().into_owned())
             } else {
@@ -558,7 +765,7 @@ fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     sync_dir(dir)
 }
 
-/// Calls `visit` for every file and link under `dir`, with its tree path.
+/// Calls `visit` for every file, link and empty directory under `dir`, with its tree path.
 fn walk_upper(
     dir: &Path,
     path: &TreePath,
@@ -586,7 +793,15 @@ fn walk_upper(
             .file_type()
             .map_err(|e| Error::io("reading", &local, e))?;
         if kind.is_dir() {
-            walk_upper(&local, &child, visit)?;
+            let empty = fs::read_dir(&local)
+                .map_err(|e| Error::io("listing", &local, e))?
+                .next()
+                .is_none();
+            if empty {
+                visit(child, &local)?;
+            } else {
+                walk_upper(&local, &child, visit)?;
+            }
         } else {
             visit(child, &local)?;
         }

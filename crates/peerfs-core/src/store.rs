@@ -239,6 +239,27 @@ impl Store {
         Ok(())
     }
 
+    /// The uncompressed length of `id`, read from its record without decompressing it.
+    pub(crate) fn raw_size(&self, id: &ObjectId) -> Result<Option<u64>> {
+        let Some(location) = self.index.get(id) else {
+            return Ok(None);
+        };
+        if location.codec == Codec::Raw {
+            return Ok(Some(u64::from(location.len)));
+        }
+        let path = self.dir.join(pack_name(location.pack));
+        let file = File::open(&path).map_err(|e| Error::io("opening", &path, e))?;
+        // A zstd frame header is at most 18 bytes, and records its content size because
+        // `put` compresses whole buffers.
+        let mut header = vec![0; to_usize(u64::from(location.len)).min(18)];
+        file.read_exact_at(&mut header, location.offset)
+            .map_err(|e| Error::io("reading", &path, e))?;
+        match zstd::zstd_safe::get_frame_content_size(&header) {
+            Ok(Some(size)) => Ok(Some(size)),
+            _ => Ok(self.get(id)?.map(|(_, bytes)| len_u64(bytes.len()))),
+        }
+    }
+
     /// Reads `id`, checks it against its identity, and returns its kind and bytes.
     pub(crate) fn get(&self, id: &ObjectId) -> Result<Option<(Kind, Vec<u8>)>> {
         let Some(location) = self.index.get(id) else {

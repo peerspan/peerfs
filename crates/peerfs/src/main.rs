@@ -94,6 +94,8 @@ enum Command {
     },
     /// List branches pulled from other hosts, as of their last pull.
     Remotes,
+    /// List mounted workspaces and where they are mounted.
+    Mounts,
     /// Print the host and the key this space signs its commits with, as `<host> <key>`:
     /// what another space gives `hosts add` to accept them.
     Key,
@@ -189,6 +191,11 @@ enum WorkspaceCommand {
     },
     /// Merge a branch, or `<host>/<branch>`, into the branch the workspace follows.
     Merge { name: String, revision: String },
+    /// Mount the workspace at an empty directory, served by the space's server until
+    /// unmounted or the server stops.
+    Mount { name: String, dir: PathBuf },
+    /// Unmount the workspace. Files still open there stop working.
+    Unmount { name: String },
     /// Delete a workspace and its uncommitted changes.
     Discard { name: String },
 }
@@ -399,6 +406,11 @@ async fn client_command(
                 )?;
             }
         }
+        Command::Mounts => {
+            for mount in client.mounts().await? {
+                writeln!(out, "{} {}", mount.workspace, mount.path)?;
+            }
+        }
         Command::Key => {
             let space = client.space().await?;
             let key = space.key.context("this space does not sign its commits")?;
@@ -444,6 +456,20 @@ async fn client_command(
         Command::Workspace(command) => return workspace(client, command, caller, out).await,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `ws snapshots`: one line per snapshot, newest first.
+async fn print_snapshots(client: &Client, name: &str, out: &mut impl Write) -> Result<()> {
+    for snapshot in client.snapshots(name).await? {
+        writeln!(
+            out,
+            "{} at {} {}",
+            snapshot.id,
+            snapshot.time_ms / 1000,
+            snapshot.message
+        )?;
+    }
+    Ok(())
 }
 
 /// `ws commit`: exits 1 on a conflict.
@@ -534,6 +560,11 @@ async fn workspace(
                 }
             }
         }
+        WorkspaceCommand::Mount { name, dir } => {
+            let mount = client.mount(&name, &absolute(&dir)?).await?;
+            writeln!(out, "{} mounted at {}", mount.workspace, mount.path)?;
+        }
+        WorkspaceCommand::Unmount { name } => client.unmount(&name).await?,
         WorkspaceCommand::Snapshot { name, message } => {
             if let SnapshotResponse::Snapshot { snapshot } =
                 client.snapshot(&name, message.as_deref(), caller).await?
@@ -541,17 +572,7 @@ async fn workspace(
                 writeln!(out, "{snapshot}")?;
             }
         }
-        WorkspaceCommand::Snapshots { name } => {
-            for snapshot in client.snapshots(&name).await? {
-                writeln!(
-                    out,
-                    "{} at {} {}",
-                    snapshot.id,
-                    snapshot.time_ms / 1000,
-                    snapshot.message
-                )?;
-            }
-        }
+        WorkspaceCommand::Snapshots { name } => print_snapshots(client, &name, out).await?,
         WorkspaceCommand::Commit { name, message } => {
             return commit(client, &name, &message, caller, out).await;
         }

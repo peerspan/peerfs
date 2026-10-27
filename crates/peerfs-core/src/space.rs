@@ -660,6 +660,31 @@ impl Space {
         ))
     }
 
+    /// The size of a file's bytes, without reading them all.
+    ///
+    /// # Errors
+    ///
+    /// Fails if an object is missing or corrupt.
+    pub fn content_size(&self, content: &Content) -> Result<u64> {
+        match content {
+            Content::Empty => Ok(0),
+            Content::Blob(id) => self.store.raw_size(id)?.ok_or(Error::MissingObject {
+                kind: Kind::Blob,
+                id: *id,
+            }),
+            Content::Chunked(id) => {
+                let bytes = self.object(*id, Kind::File)?;
+                ChunkList::decode(&bytes)
+                    .map(|list| list.size)
+                    .map_err(|source| Error::Decode {
+                        kind: Kind::File,
+                        id: *id,
+                        source,
+                    })
+            }
+        }
+    }
+
     /// Reads file bytes back.
     ///
     /// # Errors

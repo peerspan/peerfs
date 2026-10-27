@@ -15,9 +15,9 @@ use tokio::net::UnixStream;
 use crate::wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
-    HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, PullRequest,
-    PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision, SnapshotRequest,
-    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, MountInfo,
+    PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, Revision,
+    SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -610,6 +610,41 @@ impl Client {
             caller: caller.clone(),
         };
         self.json(Method::POST, &path, Some(&request)).await
+    }
+
+    /// Mounts a workspace at `path`, an absolute, empty directory on the server's host.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `conflict` if the workspace is mounted already, `invalid` for a path that
+    /// is not an empty directory, or `internal` if the kernel refuses the mount.
+    pub async fn mount(&self, workspace: &str, path: &str) -> Result<MountInfo, ClientError> {
+        let route = format!("/v1/workspaces/{}/mount", segment(workspace));
+        let request = MountInfo {
+            workspace: String::new(),
+            path: path.to_owned(),
+        };
+        self.json(Method::POST, &route, Some(&request)).await
+    }
+
+    /// Unmounts a workspace. Files still open there stop working.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `not_found` if the workspace is not mounted.
+    pub async fn unmount(&self, workspace: &str) -> Result<(), ClientError> {
+        let route = format!("/v1/workspaces/{}/mount", segment(workspace));
+        self.call_json(Method::DELETE, &route, None::<&()>).await?;
+        Ok(())
+    }
+
+    /// The mounted workspaces.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server cannot be reached or answers with an error.
+    pub async fn mounts(&self) -> Result<Vec<MountInfo>, ClientError> {
+        self.json(Method::GET, "/v1/mounts", None::<&()>).await
     }
 
     /// The snapshots of a workspace's current change, newest first.
