@@ -149,6 +149,13 @@ cargo test --workspace
 
 The lint set is BeautifulRust's (`[workspace.lints]` in `Cargo.toml`, `clippy.toml`).
 
+## Contributing
+
+We welcome bug reports, feature requests and design feedback as
+[issues](https://github.com/peerspan/peerfs/issues/new/choose). We do not accept code
+contributions from outside Peerspan, and pull requests from outside are closed. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE). `crates/nfsserve` is Hugging Face's
