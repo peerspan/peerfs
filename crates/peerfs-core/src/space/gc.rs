@@ -1,4 +1,4 @@
-//! Garbage collection for one space, with snapshot retention (decision 7).
+//! Garbage collection for one space, with snapshot retention.
 //!
 //! Marking starts from what this host must keep: branches, tracking references, and each
 //! workspace's base, merge and snapshots. Per-call snapshots are kept like a reflog: those
@@ -36,7 +36,7 @@ pub struct GcOptions {
 }
 
 impl Default for GcOptions {
-    /// Decision 7's periods: 90 days for a committed change's snapshots, 30 for any, and a
+    /// The default periods: 90 days for a committed change's snapshots, 30 for any, and a
     /// day's grace.
     fn default() -> Self {
         Self {
@@ -71,7 +71,7 @@ pub struct GcReport {
 }
 
 impl Space {
-    /// Drops what this space no longer needs to keep, under decision 7's retention: see
+    /// Drops what this space no longer needs to keep, under its snapshot retention: see
     /// the module documentation. A dry run reports the same and changes nothing.
     ///
     /// # Errors

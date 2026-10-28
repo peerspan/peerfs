@@ -4,6 +4,7 @@ description = "Wire types and a client for the peerfs local API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

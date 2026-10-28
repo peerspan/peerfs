@@ -1,6 +1,7 @@
 # Commits and bytes per tool call, from recorded agent sessions
 
-2026-10-27. Issue #2. Inputs to decisions 1, 5 and 6 of `docs-internal/docs/peerfs.md`.
+2026-10-27. Issue #2. Inputs to the design of per-call snapshots, path classes, and chunking
+and hashing.
 
 Every figure is labelled **measured** (counted or replayed from recorded data, exactly) or
 **estimated** (a model, a heuristic, or today's disk standing in for the past). The harness is
@@ -241,7 +242,7 @@ possibly-writing local Bash call changed something (**estimated** upper bound). 
 
 ## What a live hook-based run would add
 
-A `PostToolUse` hook (or the peerfs mount, once milestone 4 lands) that snapshots the workspace
+A `PostToolUse` hook (or a peerfs mount) that snapshots the workspace
 after every call, Bash included, would measure directly what is estimated or missing here:
 
 - The true commit rate: which Bash calls change files, and how many files each.
@@ -255,7 +256,7 @@ after every call, Bash included, would measure directly what is estimated or mis
 
 ## What this implies
 
-**Decision 1, when a commit happens.** A local snapshot per tool call is cheap in bytes: about
+**When a commit happens.** A local snapshot per tool call is cheap in bytes: about
 10 commits per active hour from edit tools, each one file, 3.5 KiB and 7 objects at the median —
 about 350 KiB per eight active hours of source. The out-of-band changes say the snapshot must be taken after
 every call, Bash included, from the workspace, not from the edit tools' own records, or per-call
@@ -264,14 +265,14 @@ trees and the commit, so object count, index size and anything signed per commit
 depth and commit count rather than with bytes; that supports coalescing before signing and
 replicating.
 
-**Decision 5, what a workspace contains.** Source changes are small and all go through edit
+**What a workspace contains.** Source changes are small and all go through edit
 tools or small scripts; derived data changes only through Bash and is three orders of magnitude
 larger at rest and per build. Committing derived data locally for complete undo costs megabytes
-per build call — 5.6 to 22 MiB here — so retention (decision 7) and the per-branch size cap need
+per build call — 5.6 to 22 MiB here — so retention and the per-branch size cap need
 to apply locally, not only to replication. A quarter of edit-tool commits are agent scratch and
 memory outside the project, which none of the three path classes covers yet.
 
-**Decision 6, chunking and hashing.** Files changed by edit tools have a median of 7 KiB and a
+**Chunking and hashing.** Files changed by edit tools have a median of 7 KiB and a
 max of 75 KiB, so 97.5% are stored whole and the chunk average does not affect these commits; it
 matters only for derived output. Whole-file storage is the main overhead: a median Edit changes
 478 B and stores 4.3 KiB. zstd deltas against the previous version are 2.7x smaller in total, so

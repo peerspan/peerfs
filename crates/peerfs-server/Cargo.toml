@@ -4,6 +4,7 @@ description = "The peerfs local API server: one space, served over a Unix socket
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

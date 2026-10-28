@@ -5,8 +5,8 @@
 //! the commit's identity, so it cannot be stripped or replaced without changing the id.
 //!
 //! Peerfs is meant never to hold a host key: the host daemon signs through its signing
-//! endpoint and knows its peers' keys from signed membership. Until that endpoint exists
-//! (milestone 3b), a space signs with its own key in `signing.key` ([`KeyFile`]) and trusts
+//! endpoint and knows its peers' keys from signed membership. Until that endpoint exists,
+//! a space signs with its own key in `signing.key` ([`KeyFile`]) and trusts
 //! the keys listed in its `hosts` file ([`KnownHosts`]). Both sit behind traits, so the
 //! daemon replaces them without touching the protocol.
 

@@ -1,0 +1,12 @@
+peerfs
+Copyright The Peerspan Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+Third-party code included in this repository is listed below with its original notice.
+
+crates/nfsserve: nfsserve 0.11.0 by Hugging Face (https://github.com/huggingface/nfsserve),
+vendored with changes described in crates/nfsserve/PEERFS.md. Licensed under the
+BSD 3-Clause License; see crates/nfsserve/LICENSE.
+
+  Copyright (c) 2023, XetData
+  Copyright (c) 2025, Hugging Face
