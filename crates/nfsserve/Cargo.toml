@@ -1,0 +1,25 @@
+[package]
+name = "nfsserve"
+# Hugging Face's nfsserve 0.11.0 (https://github.com/huggingface/nfsserve), vendored.
+version = "0.11.0"
+edition = "2021"
+authors = ["Rajat Arya <rajat@huggingface.co>", "Assaf Vayner <assaf@huggingface.co>"]
+description = "A Rust NFS Server implementation"
+license = "BSD-3-Clause"
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+byteorder = "1.4"
+num-traits = "0.2"
+num-derive = "0.4"
+tokio = { version = "1", features = ["net", "io-util", "sync", "fs", "rt", "macros"], default-features = false }
+tracing = "0.1.31"
+anyhow = "1"
+async-trait = "0.1.9"
+filetime = "0.2"
+
+[features]
+strict = []

@@ -6,6 +6,7 @@ members = [
     "crates/peerfs-core",
     "crates/peerfs-mount",
     "crates/peerfs-server",
+    "crates/nfsserve",
 ]
 
 [workspace.package]
