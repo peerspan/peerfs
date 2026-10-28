@@ -166,6 +166,20 @@ pub struct MountInfo {
     pub workspace: String,
     /// The directory, absolute, on the server's host; empty before mounting.
     pub path: String,
+    /// How it is mounted; FUSE when not given.
+    #[serde(default)]
+    pub frontend: Frontend,
+}
+
+/// How a workspace is mounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Frontend {
+    /// FUSE, on Linux.
+    #[default]
+    Fuse,
+    /// An NFS version 3 server on the loopback interface, mounted by the kernel's client.
+    Nfs,
 }
 
 /// `POST /v1/workspaces`: create a workspace following a branch.

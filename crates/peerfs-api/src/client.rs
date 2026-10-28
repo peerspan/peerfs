@@ -15,8 +15,8 @@ use tokio::net::UnixStream;
 use crate::wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
-    GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey, ImportRequest, MergeRequest,
-    MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
+    Frontend, GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey, ImportRequest,
+    MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
     ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SnapshotRequest, SnapshotResponse,
     SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
@@ -635,17 +635,24 @@ impl Client {
         self.json(Method::POST, &path, Some(&request)).await
     }
 
-    /// Mounts a workspace at `path`, an absolute, empty directory on the server's host.
+    /// Mounts a workspace at `path`, an absolute, empty directory on the server's host,
+    /// through `frontend`.
     ///
     /// # Errors
     ///
     /// Fails with `conflict` if the workspace is mounted already, `invalid` for a path that
     /// is not an empty directory, or `internal` if the kernel refuses the mount.
-    pub async fn mount(&self, workspace: &str, path: &str) -> Result<MountInfo, ClientError> {
+    pub async fn mount(
+        &self,
+        workspace: &str,
+        path: &str,
+        frontend: Frontend,
+    ) -> Result<MountInfo, ClientError> {
         let route = format!("/v1/workspaces/{}/mount", segment(workspace));
         let request = MountInfo {
             workspace: String::new(),
             path: path.to_owned(),
+            frontend,
         };
         self.json(Method::POST, &route, Some(&request)).await
     }

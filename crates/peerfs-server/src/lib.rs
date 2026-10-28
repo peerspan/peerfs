@@ -24,16 +24,17 @@ use axum::routing::{get, post};
 use peerfs_api::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest,
     CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
-    ExportRequest, FetchRequest, ForkRequest, GcRequest, GcResponse, HaveRequest, HaveResponse,
-    HostKey, ImportRequest, MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse,
-    PushRequest, PushResponse, ReceiveResponse, RestoreRequest, RestoreResponse, Revision,
-    SOCKET_NAME, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    ExportRequest, FetchRequest, ForkRequest, Frontend, GcRequest, GcResponse, HaveRequest,
+    HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, MountInfo, PullRequest,
+    PullResponse, PushRequest, PushResponse, ReceiveResponse, RestoreRequest, RestoreResponse,
+    Revision, SOCKET_NAME, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo,
+    WorkspaceInfo,
 };
 use peerfs_core::{
     Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH, GcOptions,
     MergeOutcome, Merged, ObjectId, PublicKey, Space, Workspace, decode_objects, encode_objects,
 };
-use peerfs_mount::Mount;
+use peerfs_mount::{Frontend as MountFrontend, Mount};
 use serde::Deserialize;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
@@ -1014,19 +1015,21 @@ async fn mount_workspace(
                 mounted.path().display()
             )));
         }
-        let mount =
-            Mount::new(Arc::clone(&shared.space), &name, &path).map_err(|e| match e.kind() {
+        let frontend = match request.frontend {
+            Frontend::Fuse => MountFrontend::Fuse,
+            Frontend::Nfs => MountFrontend::Nfs,
+        };
+        let mount = Mount::new(Arc::clone(&shared.space), &name, &path, frontend).map_err(|e| {
+            match e.kind() {
                 io::ErrorKind::NotFound
                 | io::ErrorKind::DirectoryNotEmpty
                 | io::ErrorKind::NotADirectory => {
                     ApiError::invalid(format!("{}: {e}", path.display()))
                 }
                 _ => ApiError::internal(&format!("mounting at {}: {e}", path.display())),
-            })?;
-        let info = MountInfo {
-            workspace: name.clone(),
-            path: mount.path().display().to_string(),
-        };
+            }
+        })?;
+        let info = mount_info(&name, &mount);
         mounts.insert(name, mount);
         Ok((StatusCode::CREATED, Json(info)))
     })
@@ -1054,12 +1057,20 @@ async fn mounts(State(state): State<AppState>) -> ApiResult<Json<Vec<MountInfo>>
     Ok(Json(
         lock_mounts(&state)
             .iter()
-            .map(|(workspace, mount)| MountInfo {
-                workspace: workspace.clone(),
-                path: mount.path().display().to_string(),
-            })
+            .map(|(workspace, mount)| mount_info(workspace, mount))
             .collect(),
     ))
+}
+
+fn mount_info(workspace: &str, mount: &Mount) -> MountInfo {
+    MountInfo {
+        workspace: workspace.to_owned(),
+        path: mount.path().display().to_string(),
+        frontend: match mount.frontend() {
+            MountFrontend::Fuse => Frontend::Fuse,
+            MountFrontend::Nfs => Frontend::Nfs,
+        },
+    }
 }
 
 async fn remotes(State(state): State<AppState>) -> ApiResult<Json<Vec<TrackingInfo>>> {

@@ -924,10 +924,13 @@ dependencies = [
 name = "peerfs-mount"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "fuse-backend-rs",
  "libc",
+ "nfsserve",
  "peerfs-core",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

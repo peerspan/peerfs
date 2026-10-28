@@ -9,7 +9,7 @@ selectively is the broader one.
 
 The design and its agreed decisions are in `peerspan/docs-internal`, `docs/peerfs.md`.
 
-## Status: milestones 1 and 2, 3a (pull, push and merge between spaces, signed commits, snapshots and a Claude Code hook that takes one per tool call), and the first slices of 4 (a FUSE mount on Linux, path classes)
+## Status: milestones 1 and 2, 3a (pull, push and merge between spaces, signed commits, snapshots and a Claude Code hook that takes one per tool call), and the first slices of 4 (a FUSE mount on Linux, path classes, a loopback NFS mount for macOS, tested on Linux)
 
 What works today, on one host:
 
@@ -27,7 +27,7 @@ What works today, on one host:
 | Snapshots | `ws snapshot`, meant once per tool call, stores the workspace's tree as an unsigned commit for its current change, chained to the change's previous snapshot; the branch and overlay are untouched and snapshots never leave the host. `ws commit` ends the change: it takes a last snapshot, merges onto the moved head, and stores one signed commit whose `predecessor` names that snapshot. The link is weak, so pushing and pulling never carry snapshots. `ws restore NAME SNAPSHOT` (a unique start of the ID is enough) puts the source paths back as a snapshot had them, keeping derived and secret paths; it snapshots before and after, so every step stays listed and restoring a later one goes forward again. It is refused once the change has moved onto a new base (a conflicted commit or a merge), since earlier snapshots would undo what that brought | 1 |
 | Signing | Every commit is signed with Ed25519 when stored; the signature covers a domain-separated encoding of the commit and is part of its identity. A commit pulled or pushed in is refused unless it is signed by a key listed for the host it names as its author. For now a space signs with its own `signing.key` and trusts the keys in its `hosts` file (`peerfs key`, `peerfs hosts add`); in 3b the host daemon signs and supplies peers' keys, behind the same `Signer` and `HostKeys` traits | 3, 9 |
 | Merge | `ws merge` brings a branch or `<host>/<branch>` into a workspace's branch: up to date, fast-forward, a clean merge commit with both parents, or conflict markers to resolve, after which the commit records both parents. A refused push is followed by pull, merge, push | 2 |
-| Mount | `ws mount NAME DIR` serves a workspace as an ordinary directory over FUSE (Linux), from the space's server through fuse-backend-rs, the library that also serves vhost-user-fs for VMs. Base files read from the store; the first write copies a file into the overlay; removals are whiteouts; a directory holding committed content is renamed by copying (`EXDEV`), as on kernel overlay file systems; empty directories are kept; hard links share one overlay file. Data is durable at `fsync`. A base file's mtime is the workspace's date for its content at that path: the overlay file's mtime when a commit took it, or when the workspace first saw it, so commits and remounts do not make files look modified. `git` and `cargo build`/`test` run in it | 4 |
+| Mount | `ws mount NAME DIR` serves a workspace as an ordinary directory over FUSE (Linux), from the space's server through fuse-backend-rs, the library that also serves vhost-user-fs for VMs. Base files read from the store; the first write copies a file into the overlay; removals are whiteouts; a directory holding committed content is renamed by copying (`EXDEV`), as on kernel overlay file systems; empty directories are kept; hard links share one overlay file. Data is durable at `fsync`. A base file's mtime is the workspace's date for its content at that path: the overlay file's mtime when a commit took it, or when the workspace first saw it, so commits and remounts do not make files look modified. `git` and `cargo build`/`test` run in it. `ws mount NAME DIR --nfs` serves it over NFS version 3 on `127.0.0.1` instead, for macOS, where FUSE needs a kernel extension: the same code behind a vendored `nfsserve`, exporting `/<workspace>`, accepting only reserved source ports (the kernel's client), and mounted `soft` so a dead server fails calls instead of hanging them. Writes are synced at COMMIT, which the client sends at `fsync` and when a written file is closed | 4 |
 | Agent hook | `peerfs hook claude-code`, a Claude Code `PostToolUse` hook, snapshots each mounted workspace a tool call touched (the session's directory, or a path in the tool's input), shell commands included, recording the tool and its tool use ID; outside a peerfs mount it does nothing and starts no server | 1 |
 | Path classes | Every path is **source** (committed, snapshotted, replicated), **derived** (dependencies and build output) or **secret** (credentials and keys). Derived and secret paths stay as files in the workspace across commits; no commit or snapshot takes them, so they are never replicated and secrets are never hashed. Built-in defaults always apply (`node_modules/`, `target/`, `.venv/`, `dist/`, `build/`, `.git/`, ...; `.env*`, keys, cloud and package credentials, with templates such as `.env.example` and `*.pub` left as source). A `.gitignore` can only add derived paths. The owner's `<space>/classes` file adds rules under `[source]`, `[derived]` and `[secret]`; an owner's source rule wins over everything, and secret wins over derived. `ws status` lists them as kept local | 5 |
 | Garbage collection | `peerfs gc [--dry-run]`, run by hand, drops what the space no longer needs. It keeps branches, tracking references, and each workspace's base, merge and current snapshots, with everything they reach. Snapshots are kept like a reflog: a committed change's for 90 days after its commit, any snapshot for 30 days after it was taken, and a kept snapshot keeps the earlier ones of its change. Packs written in the last day are left alone, so a pull or push in progress keeps its objects. The packs it rewrites are copied, synced, and only then removed, so a crash leaves at worst an object held twice | 7 |
@@ -38,11 +38,13 @@ What works today, on one host:
 Not yet: signing through the host daemon, replication between hosts and durability receipts, owner rules for
 conflicts (`regenerate`, `ours`/`theirs`, structured merge), sharing derived data through
 an environment-keyed cache, a content scan for secrets inside source files, automatic garbage collection and expiring abandoned workspaces, branch handoff, the local contract with the Peerspan host
-daemon, FUSE passthrough, and the NFS (macOS) and VM frontends. Files are read and written
+daemon, FUSE passthrough, the VM frontends, and NFS on macOS itself (the hook reads
+mounts from `/proc`, and the macOS client is untested). Files are read and written
 whole in memory, and the server applies requests one at a time. Linux and macOS only.
 
-On this repository the mount is close to native: a clean `cargo build` takes 42-45 s against
-39-47 s natively, and a no-change rebuild 0.30-0.36 s against 0.21-0.25 s. Writes travel up to
+On this repository the mount is close to native: a clean `cargo build` takes 42-46 s against
+37-47 s natively, and a no-change rebuild 0.27-0.41 s against 0.20-0.25 s. Over NFS on Linux
+the same take 51-57 s and 0.38-0.56 s. Writes travel up to
 1 MiB per request, recently used overlay files stay open, and the mount rereads the
 workspace only after the local API changes it. The kernel caches names and attributes for a
 second, so for that long after a commit or another change through the local API, the
@@ -76,7 +78,7 @@ the request names.
 | `POST /v1/objects/fetch` | Objects by id (`{ids}`, at most 256), as `application/octet-stream`; those not held are left out |
 | `POST /v1/pull` | Pull a branch from another server (`{from, branch}`, `from` its socket); the space is held only between fetches |
 | `GET /v1/remotes` | Tracking references, with when each was pulled |
-| `POST, DELETE /v1/workspaces/{name}/mount` | Mount the workspace (`{path}`, an absolute empty directory); unmount it |
+| `POST, DELETE /v1/workspaces/{name}/mount` | Mount the workspace (`{path, frontend}`: an absolute empty directory, and `fuse`, the default, or `nfs`); unmount it |
 | `GET /v1/mounts` | Mounted workspaces and their directories |
 | `POST /v1/gc` | Collect garbage (`{dry_run}`); returns what was dropped, or would be, and what was kept |
 | `GET, POST /v1/hosts` | Keys trusted to sign other hosts' commits; add one (`{host, key}`, the key in standard Base64) |
@@ -130,7 +132,8 @@ nothing about 12 ms. Errors exit 1, which Claude Code shows without stopping the
 | --- | --- |
 | `crates/peerfs-core` | The library: objects, store, branches, workspaces, merge |
 | `crates/peerfs-api` | The local API's JSON bodies and a client over its socket |
-| `crates/peerfs-mount` | A workspace as a FUSE file system |
+| `crates/peerfs-mount` | A workspace as a FUSE or loopback NFS file system |
+| `crates/nfsserve` | Hugging Face's `nfsserve` 0.11.0 (BSD-3-Clause), vendored with LINK, COMMIT, a READDIR fix and reserved-port checks; see its `PEERFS.md` |
 | `crates/peerfs-server` | The server: one space behind the API |
 | `crates/peerfs` | The command-line interface, a client of the server |
 

@@ -20,8 +20,10 @@ peerfs-api = { path = "crates/peerfs-api" }
 peerfs-core = { path = "crates/peerfs-core" }
 peerfs-mount = { path = "crates/peerfs-mount" }
 peerfs-server = { path = "crates/peerfs-server" }
+nfsserve = { path = "crates/nfsserve" }
 
 anyhow = "1"
+async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 base64 = "0.22"
 blake3 = "1.8"

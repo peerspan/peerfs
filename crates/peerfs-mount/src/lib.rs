@@ -1,8 +1,9 @@
-//! A peerfs workspace as a file system, served over FUSE.
+//! A peerfs workspace as a file system, served over FUSE or loopback NFS.
 //!
 //! [`WorkspaceFs`] implements fuse-backend-rs's `FileSystem` on top of a [`Workspace`], so
-//! the same code serves `/dev/fuse` on Linux and, later, vhost-user-fs for VMs. Every
-//! operation takes the space's lock, so the mount and the local API see one workspace.
+//! the same code serves `/dev/fuse` on Linux and, later, vhost-user-fs for VMs. The NFS
+//! server, for macOS, answers with the same code; see [`Frontend::Nfs`]. Every operation
+//! takes the space's lock, so the mount and the local API see one workspace.
 //!
 //! - Reads come from the overlay's real file, or from the store for a file only in the
 //!   base. Recently read base files are kept decoded.
@@ -47,6 +48,8 @@ use fuse_backend_rs::transport::{FuseChannel, FuseSession};
 use peerfs_core::{
     Content, Entry, EntryKind, Error, FileMode, Located, Name, NewEntry, Space, TreePath, Workspace,
 };
+
+mod nfs;
 
 /// How long the kernel may cache names and attributes. Short, because the local API can
 /// change the workspace underneath the mount.
@@ -260,6 +263,23 @@ impl OpenFiles {
     }
 }
 
+/// Where a write goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAt {
+    Offset(u64),
+    /// The end of the file, as for a file opened to append.
+    End,
+}
+
+/// What `fsync` makes durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sync {
+    /// The data, and the metadata needed to read it back.
+    Data,
+    /// The data and all metadata.
+    All,
+}
+
 /// What the mount remembers between requests.
 #[derive(Debug)]
 struct State {
@@ -413,6 +433,112 @@ impl WorkspaceFs {
             attr_flags: 0,
             attr_timeout: TTL,
             entry_timeout: TTL,
+        })
+    }
+
+    /// The inode number of the directory holding `inode`; the root's is its own.
+    fn parent(&self, inode: u64) -> io::Result<u64> {
+        self.with(|_, _, state| {
+            let path = state.inodes.path(inode)?;
+            Ok(path
+                .split_last()
+                .map_or(ROOT, |(parent, _)| state.inodes.number(&parent)))
+        })
+    }
+
+    /// Reads up to `size` bytes at `offset` of the file `inode`, fewer only at its end.
+    fn read_bytes(&self, inode: u64, size: u32, offset: u64) -> io::Result<Vec<u8>> {
+        self.with(|space, workspace, state| {
+            let path = state.inodes.path(inode)?;
+            if let Some(file) = state.files.get(&path, Access::Read) {
+                return read_at(file, size, offset);
+            }
+            match workspace.locate(space, &path).map_err(to_errno)? {
+                Some(Located::Local(local)) => {
+                    state.files.open(&path, &local, Access::Read)?;
+                    let file = state
+                        .files
+                        .get(&path, Access::Read)
+                        .ok_or_else(|| errno(libc::EIO))?;
+                    read_at(file, size, offset)
+                }
+                Some(Located::Base(Entry::File { content, .. })) => {
+                    let bytes = state.cache.get(space, &content)?;
+                    let start = to_usize_saturating(offset).min(bytes.len());
+                    let end = start.saturating_add(to_usize(size)).min(bytes.len());
+                    Ok(bytes[start..end].to_vec())
+                }
+                Some(Located::Base(Entry::Tree(_))) => Err(errno(libc::EISDIR)),
+                Some(Located::Base(Entry::Symlink(_))) => Err(errno(libc::EINVAL)),
+                None => Err(errno(libc::ENOENT)),
+            }
+        })
+    }
+
+    /// Writes `data` to the file `inode`, at `at`.
+    fn write_bytes(&self, inode: u64, at: WriteAt, data: &[u8]) -> io::Result<usize> {
+        self.with(|space, workspace, state| {
+            let path = state.inodes.path(inode)?;
+            let WriteAt::Offset(offset) = at else {
+                let local = workspace.copy_up(space, &path).map_err(to_errno)?;
+                FsOpenOptions::new()
+                    .append(true)
+                    .open(&local)?
+                    .write_all(data)?;
+                return Ok(data.len());
+            };
+            if state.files.get(&path, Access::Write).is_none() {
+                let local = workspace.copy_up(space, &path).map_err(to_errno)?;
+                state.files.open(&path, &local, Access::Write)?;
+            }
+            state
+                .files
+                .get(&path, Access::Write)
+                .ok_or_else(|| errno(libc::EIO))?
+                .write_all_at(data, offset)?;
+            Ok(data.len())
+        })
+    }
+
+    /// The directory `inode`'s entries, `.` and `..` first: inode number, type and name.
+    fn entries(&self, inode: u64) -> io::Result<Vec<(u64, u8, Vec<u8>)>> {
+        self.with(|space, workspace, state| {
+            let path = state.inodes.path(inode)?;
+            let parent = path
+                .split_last()
+                .map_or(ROOT, |(parent, _)| state.inodes.number(&parent));
+            let mut entries = vec![
+                (inode, libc::DT_DIR, b".".to_vec()),
+                (parent, libc::DT_DIR, b"..".to_vec()),
+            ];
+            for (name, kind) in workspace.list(space, &path.to_string()).map_err(to_errno)? {
+                let child = child_named(&path, &name)?;
+                let kind = match kind {
+                    EntryKind::File => libc::DT_REG,
+                    EntryKind::Symlink => libc::DT_LNK,
+                    EntryKind::Directory => libc::DT_DIR,
+                };
+                entries.push((state.inodes.number(&child), kind, name.into_bytes()));
+            }
+            Ok(entries)
+        })
+    }
+
+    /// Syncs the file `inode` as `what` says.
+    fn sync(&self, inode: u64, what: Sync) -> io::Result<()> {
+        self.with(|space, workspace, state| {
+            let path = state.inodes.path(inode)?;
+            if let Some(Located::Local(local)) = workspace.locate(space, &path).map_err(to_errno)? {
+                let file = File::open(&local)?;
+                match what {
+                    Sync::Data => file.sync_data()?,
+                    Sync::All => file.sync_all()?,
+                }
+                if let Some(parent) = local.parent() {
+                    File::open(parent)?.sync_all()?;
+                }
+            }
+            Ok(())
         })
     }
 
@@ -656,31 +782,7 @@ impl FileSystem for WorkspaceFs {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> io::Result<usize> {
-        let bytes = self.with(|space, workspace, state| {
-            let path = state.inodes.path(inode)?;
-            if let Some(file) = state.files.get(&path, Access::Read) {
-                return read_at(file, size, offset);
-            }
-            match workspace.locate(space, &path).map_err(to_errno)? {
-                Some(Located::Local(local)) => {
-                    state.files.open(&path, &local, Access::Read)?;
-                    let file = state
-                        .files
-                        .get(&path, Access::Read)
-                        .ok_or_else(|| errno(libc::EIO))?;
-                    read_at(file, size, offset)
-                }
-                Some(Located::Base(Entry::File { content, .. })) => {
-                    let bytes = state.cache.get(space, &content)?;
-                    let start = to_usize_saturating(offset).min(bytes.len());
-                    let end = start.saturating_add(to_usize(size)).min(bytes.len());
-                    Ok(bytes[start..end].to_vec())
-                }
-                Some(Located::Base(Entry::Tree(_))) => Err(errno(libc::EISDIR)),
-                Some(Located::Base(Entry::Symlink(_))) => Err(errno(libc::EINVAL)),
-                None => Err(errno(libc::ENOENT)),
-            }
-        })?;
+        let bytes = self.read_bytes(inode, size, offset)?;
         w.write_all(&bytes)?;
         Ok(bytes.len())
     }
@@ -700,27 +802,12 @@ impl FileSystem for WorkspaceFs {
     ) -> io::Result<usize> {
         let mut data = vec![0; to_usize(size)];
         r.read_exact(&mut data)?;
-        self.with(|space, workspace, state| {
-            let path = state.inodes.path(inode)?;
-            if flags & u32::try_from(libc::O_APPEND).unwrap_or(0) != 0 {
-                let local = workspace.copy_up(space, &path).map_err(to_errno)?;
-                FsOpenOptions::new()
-                    .append(true)
-                    .open(&local)?
-                    .write_all(&data)?;
-                return Ok(data.len());
-            }
-            if state.files.get(&path, Access::Write).is_none() {
-                let local = workspace.copy_up(space, &path).map_err(to_errno)?;
-                state.files.open(&path, &local, Access::Write)?;
-            }
-            state
-                .files
-                .get(&path, Access::Write)
-                .ok_or_else(|| errno(libc::EIO))?
-                .write_all_at(&data, offset)?;
-            Ok(data.len())
-        })
+        let at = if flags & u32::try_from(libc::O_APPEND).unwrap_or(0) == 0 {
+            WriteAt::Offset(offset)
+        } else {
+            WriteAt::End
+        };
+        self.write_bytes(inode, at, &data)
     }
 
     fn flush(&self, _ctx: &Context, _inode: u64, _handle: u64, _lock_owner: u64) -> io::Result<()> {
@@ -728,21 +815,7 @@ impl FileSystem for WorkspaceFs {
     }
 
     fn fsync(&self, _ctx: &Context, inode: u64, datasync: bool, _handle: u64) -> io::Result<()> {
-        self.with(|space, workspace, state| {
-            let path = state.inodes.path(inode)?;
-            if let Some(Located::Local(local)) = workspace.locate(space, &path).map_err(to_errno)? {
-                let file = File::open(&local)?;
-                if datasync {
-                    file.sync_data()?;
-                } else {
-                    file.sync_all()?;
-                }
-                if let Some(parent) = local.parent() {
-                    File::open(parent)?.sync_all()?;
-                }
-            }
-            Ok(())
-        })
+        self.sync(inode, if datasync { Sync::Data } else { Sync::All })
     }
 
     fn release(
@@ -772,26 +845,7 @@ impl FileSystem for WorkspaceFs {
         offset: u64,
         add_entry: &mut dyn FnMut(DirEntry<'_>) -> io::Result<usize>,
     ) -> io::Result<()> {
-        let entries = self.with(|space, workspace, state| {
-            let path = state.inodes.path(inode)?;
-            let parent = path
-                .split_last()
-                .map_or(ROOT, |(parent, _)| state.inodes.number(&parent));
-            let mut entries = vec![
-                (inode, libc::DT_DIR, b".".to_vec()),
-                (parent, libc::DT_DIR, b"..".to_vec()),
-            ];
-            for (name, kind) in workspace.list(space, &path.to_string()).map_err(to_errno)? {
-                let child = child_named(&path, &name)?;
-                let kind = match kind {
-                    EntryKind::File => libc::DT_REG,
-                    EntryKind::Symlink => libc::DT_LNK,
-                    EntryKind::Directory => libc::DT_DIR,
-                };
-                entries.push((state.inodes.number(&child), kind, name.into_bytes()));
-            }
-            Ok(entries)
-        })?;
+        let entries = self.entries(inode)?;
         for (index, (ino, kind, name)) in
             entries.iter().enumerate().skip(to_usize_saturating(offset))
         {
@@ -809,52 +863,73 @@ impl FileSystem for WorkspaceFs {
     }
 }
 
+/// How a workspace is mounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Frontend {
+    /// FUSE, on Linux.
+    #[default]
+    Fuse,
+    /// An NFS version 3 server on the loopback interface, mounted by the kernel's client: for
+    /// macOS, and testable on Linux. Mounting needs the privileges `mount` needs.
+    Nfs,
+}
+
 /// A workspace mounted at a directory, served by threads of this process. Dropping it
 /// unmounts.
 pub struct Mount {
     path: PathBuf,
-    session: Option<FuseSession>,
-    threads: Vec<JoinHandle<()>>,
+    served: Served,
+}
+
+enum Served {
+    Fuse {
+        session: Option<FuseSession>,
+        threads: Vec<JoinHandle<()>>,
+    },
+    Nfs(nfs::NfsMount),
 }
 
 impl Mount {
-    /// Mounts `workspace` of `space` at `path`, an existing empty directory.
+    /// Mounts `workspace` of `space` at `path`, an existing empty directory, through
+    /// `frontend`.
     ///
     /// # Errors
     ///
     /// Fails if `path` is not an empty directory, or the kernel refuses the mount.
-    pub fn new(space: Arc<Mutex<Space>>, workspace: &str, path: &Path) -> io::Result<Self> {
+    pub fn new(
+        space: Arc<Mutex<Space>>,
+        workspace: &str,
+        path: &Path,
+        frontend: Frontend,
+    ) -> io::Result<Self> {
         if fs::read_dir(path)?.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::DirectoryNotEmpty,
                 format!("{} is not empty", path.display()),
             ));
         }
-        let server = Arc::new(Server::new(Arc::new(WorkspaceFs::new(space, workspace))));
-        let mut session =
-            FuseSession::new(path, "peerfs", workspace, false).map_err(|e| fuse_error(&e))?;
-        session.set_allow_other(false);
-        session.mount().map_err(|e| fuse_error(&e))?;
-        let mut threads = Vec::new();
-        for _ in 0..THREADS {
-            let channel = session.new_channel().map_err(|e| fuse_error(&e))?;
-            let server = Arc::clone(&server);
-            threads.push(
-                thread::Builder::new()
-                    .name("peerfs-fuse".to_owned())
-                    .spawn(move || serve(&server, channel))?,
-            );
-        }
+        let fs = WorkspaceFs::new(space, workspace);
+        let served = match frontend {
+            Frontend::Fuse => mount_fuse(fs, workspace, path)?,
+            Frontend::Nfs => Served::Nfs(nfs::NfsMount::new(fs, workspace, path)?),
+        };
         Ok(Self {
             path: path.to_owned(),
-            session: Some(session),
-            threads,
+            served,
         })
     }
 
     /// Where the workspace is mounted.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// How the workspace is mounted.
+    pub fn frontend(&self) -> Frontend {
+        match self.served {
+            Served::Fuse { .. } => Frontend::Fuse,
+            Served::Nfs(_) => Frontend::Nfs,
+        }
     }
 
     /// Unmounts and waits for the serving threads to finish.
@@ -867,18 +942,23 @@ impl Mount {
     }
 
     fn stop(&mut self) -> io::Result<()> {
-        if let Some(mut session) = self.session.take() {
-            let unmounted = session.umount().map_err(|e| fuse_error(&e));
-            if let Err(e) = unmounted {
-                self.session = Some(session);
-                return Err(e);
+        match &mut self.served {
+            Served::Fuse { session, threads } => {
+                if let Some(mut mounted) = session.take() {
+                    let unmounted = mounted.umount().map_err(|e| fuse_error(&e));
+                    if let Err(e) = unmounted {
+                        *session = Some(mounted);
+                        return Err(e);
+                    }
+                    mounted.wake().map_err(|e| fuse_error(&e))?;
+                }
+                for thread in threads.drain(..) {
+                    let _ = thread.join();
+                }
+                Ok(())
             }
-            session.wake().map_err(|e| fuse_error(&e))?;
+            Served::Nfs(mount) => mount.stop(&self.path),
         }
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-        Ok(())
     }
 }
 
@@ -886,7 +966,7 @@ impl std::fmt::Debug for Mount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mount")
             .field("path", &self.path)
-            .field("mounted", &self.session.is_some())
+            .field("frontend", &self.frontend())
             .finish_non_exhaustive()
     }
 }
@@ -895,6 +975,28 @@ impl Drop for Mount {
     fn drop(&mut self) {
         let _ = self.stop();
     }
+}
+
+fn mount_fuse(fs: WorkspaceFs, workspace: &str, path: &Path) -> io::Result<Served> {
+    let server = Arc::new(Server::new(Arc::new(fs)));
+    let mut session =
+        FuseSession::new(path, "peerfs", workspace, false).map_err(|e| fuse_error(&e))?;
+    session.set_allow_other(false);
+    session.mount().map_err(|e| fuse_error(&e))?;
+    let mut threads = Vec::new();
+    for _ in 0..THREADS {
+        let channel = session.new_channel().map_err(|e| fuse_error(&e))?;
+        let server = Arc::clone(&server);
+        threads.push(
+            thread::Builder::new()
+                .name("peerfs-fuse".to_owned())
+                .spawn(move || serve(&server, channel))?,
+        );
+    }
+    Ok(Served::Fuse {
+        session: Some(session),
+        threads,
+    })
 }
 
 fn serve(server: &Server<Arc<WorkspaceFs>>, mut channel: FuseChannel) {

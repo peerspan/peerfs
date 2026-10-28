@@ -192,6 +192,25 @@ pub trait NFSFileSystem: Sync {
     /// Reads a symlink
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3>;
 
+    /// Makes `linkname` in `dirid` a hard link to `id`, returning the attributes of `id`
+    /// afterwards. Not supported unless implemented.
+    async fn link(&self, _id: fileid3, _dirid: fileid3, _linkname: &filename3) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_NOTSUPP)
+    }
+
+    /// Whether `write` may return before the data is on stable storage. If so, WRITE replies
+    /// UNSTABLE unless the client asked for a synchronous write, and the client sends COMMIT,
+    /// which calls `commit`, before it relies on the data. By default writes are taken to be
+    /// stable when `write` returns.
+    fn unstable_writes(&self) -> bool {
+        false
+    }
+
+    /// Puts the data written to `id` on stable storage, returning its attributes.
+    async fn commit(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
+        self.getattr(id).await
+    }
+
     /// Get static file system Information
     async fn fsinfo(&self, root_fileid: fileid3) -> Result<fsinfo3, nfsstat3> {
         let dir_attr: nfs::post_op_attr = match self.getattr(root_fileid).await {

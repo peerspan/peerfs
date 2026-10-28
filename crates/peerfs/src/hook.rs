@@ -61,6 +61,9 @@ pub(crate) struct ToolCall {
 pub(crate) struct MountPoint {
     pub(crate) dir: PathBuf,
     pub(crate) workspace: String,
+    /// Over loopback NFS, which another server could also export, so it is peerfs's only
+    /// if the space's server says so.
+    pub(crate) nfs: bool,
 }
 
 /// Snapshots each workspace mounted at a path the tool call touched. Prints nothing; an
@@ -101,6 +104,9 @@ pub(crate) async fn claude_code(
         let ours = served
             .iter()
             .any(|info| info.workspace == mount.workspace && Path::new(&info.path) == mount.dir);
+        if !ours && mount.nfs {
+            continue;
+        }
         if !ours {
             bail!(
                 "{} is not mounted by the space {}; set PEERFS_SPACE to the space that mounted it",
@@ -123,19 +129,30 @@ pub(crate) async fn claude_code(
 }
 
 /// The peerfs mounts in `/proc/self/mountinfo`: FUSE mounts whose source is `peerfs`, the
-/// workspace being the subtype.
+/// workspace being the subtype, and NFS mounts of `127.0.0.1:/<workspace>`.
 pub(crate) fn peerfs_mounts(mountinfo: &str) -> Vec<MountPoint> {
     mountinfo
         .lines()
         .filter_map(|line| {
             // `id parent dev root mountpoint options [optional...] - fstype source super`
             let (before, after) = line.split_once(" - ")?;
-            let dir = before.split(' ').nth(4)?;
+            let dir = PathBuf::from(unescape(before.split(' ').nth(4)?));
             let mut after = after.split(' ');
-            let workspace = after.next()?.strip_prefix("fuse.")?;
-            (after.next()? == "peerfs").then(|| MountPoint {
-                dir: PathBuf::from(unescape(dir)),
-                workspace: unescape(workspace),
+            let (fstype, source) = (after.next()?, after.next()?);
+            if let Some(workspace) = fstype.strip_prefix("fuse.") {
+                return (source == "peerfs").then(|| MountPoint {
+                    dir,
+                    workspace: unescape(workspace),
+                    nfs: false,
+                });
+            }
+            let workspace = source.strip_prefix("127.0.0.1:/")?;
+            (fstype == "nfs" && !workspace.is_empty() && !workspace.contains('/')).then(|| {
+                MountPoint {
+                    dir,
+                    workspace: unescape(workspace),
+                    nfs: true,
+                }
             })
         })
         .collect()
@@ -235,6 +252,9 @@ mod tests {
 40 22 0:50 / /work/agent\\0401 rw,nosuid,nodev,relatime shared:20 - fuse.agent-1 peerfs rw,user_id=0
 41 40 0:51 / /work/agent\\0401/vendor rw shared:21 - fuse.vendor peerfs rw,user_id=0
 42 22 0:52 / /other rw shared:22 - fuse.sshfs remote:/x rw,user_id=0
+43 22 0:53 / /work/nfs rw,relatime shared:23 - nfs 127.0.0.1:/agent-2 rw,vers=3,port=40285
+44 22 0:54 / /work/remote rw,relatime shared:24 - nfs files.lan:/agent-3 rw,vers=3
+45 22 0:55 / /work/deep rw,relatime shared:25 - nfs 127.0.0.1:/srv/data rw,vers=3
 ";
 
     #[test]
@@ -245,10 +265,17 @@ mod tests {
                 MountPoint {
                     dir: PathBuf::from("/work/agent 1"),
                     workspace: "agent-1".to_owned(),
+                    nfs: false,
                 },
                 MountPoint {
                     dir: PathBuf::from("/work/agent 1/vendor"),
                     workspace: "vendor".to_owned(),
+                    nfs: false,
+                },
+                MountPoint {
+                    dir: PathBuf::from("/work/nfs"),
+                    workspace: "agent-2".to_owned(),
+                    nfs: true,
                 },
             ]
         );

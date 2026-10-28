@@ -1,4 +1,10 @@
-//! A workspace mounted over FUSE, driven with ordinary file operations.
+//! A workspace mounted over FUSE and over loopback NFS, driven with ordinary file
+//! operations. Each test runs once per front end this machine can mount.
+
+#![expect(
+    clippy::unwrap_used,
+    reason = "test bodies are plain functions, run per front end by generated tests"
+)]
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -7,7 +13,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use peerfs_core::{Author, CommitOutcome, NewEntry, Space, TreePath};
-use peerfs_mount::Mount;
+use peerfs_mount::{Frontend, Mount};
 
 fn author() -> Author {
     Author {
@@ -16,14 +22,44 @@ fn author() -> Author {
     }
 }
 
-/// Whether this machine lets the test mount FUSE file systems.
-fn fuse_available() -> bool {
-    fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/fuse")
-        .is_ok()
+/// Whether this machine lets the test mount through `frontend`.
+fn available(frontend: Frontend) -> bool {
+    match frontend {
+        Frontend::Fuse => fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+            .is_ok(),
+        // Mounting NFS takes root and the kernel client's mount helper.
+        Frontend::Nfs => {
+            // SAFETY: geteuid has no preconditions and cannot fail.
+            let root = unsafe { libc::geteuid() } == 0;
+            root && ["/sbin/mount.nfs", "/usr/sbin/mount.nfs"]
+                .iter()
+                .any(|helper| Path::new(helper).exists())
+        }
+    }
 }
+
+/// Generates, for each named test function taking a [`Frontend`], a test per front end.
+macro_rules! per_frontend {
+    ($($test:ident),* $(,)?) => {
+        mod fuse {
+            $(#[test] fn $test() { super::$test(super::Frontend::Fuse) })*
+        }
+        mod nfs {
+            $(#[test] fn $test() { super::$test(super::Frontend::Nfs) })*
+        }
+    };
+}
+
+per_frontend!(
+    files_read_write_and_commit_through_the_mount,
+    git_works_in_a_mounted_workspace,
+    hard_links_share_one_file,
+    files_the_mount_holds_open_follow_changes_through_the_api,
+    the_mount_shows_a_restored_snapshot,
+);
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -33,10 +69,10 @@ struct Fixture {
 }
 
 /// A space whose `main` holds `src/lib.rs`, `run.sh` (executable) and `docs/a.md`, with
-/// workspace `w` mounted.
-fn fixture() -> Option<Fixture> {
-    if !fuse_available() {
-        // This machine cannot mount FUSE file systems; there is nothing to test.
+/// workspace `w` mounted through `frontend`.
+fn fixture(frontend: Frontend) -> Option<Fixture> {
+    if !available(frontend) {
+        // This machine cannot mount this way; there is nothing to test.
         return None;
     }
     let dir = tempfile::tempdir().expect("test setup");
@@ -57,7 +93,7 @@ fn fixture() -> Option<Fixture> {
     let space = Arc::new(Mutex::new(space));
     let root = dir.path().join("mnt");
     fs::create_dir(&root).expect("test setup");
-    let mount = Mount::new(Arc::clone(&space), "w", &root).expect("test setup");
+    let mount = Mount::new(Arc::clone(&space), "w", &root, frontend).expect("test setup");
     Some(Fixture {
         _dir: dir,
         space,
@@ -89,9 +125,10 @@ fn listing(dir: &Path) -> Vec<String> {
     names
 }
 
-#[test]
-fn files_read_write_and_commit_through_the_mount() {
-    let Some(fixture) = fixture() else { return };
+fn files_read_write_and_commit_through_the_mount(frontend: Frontend) {
+    let Some(fixture) = fixture(frontend) else {
+        return;
+    };
     let root = &fixture.root;
 
     assert_eq!(listing(root), ["docs", "run.sh", "src"]);
@@ -177,9 +214,10 @@ fn files_read_write_and_commit_through_the_mount() {
     );
 }
 
-#[test]
-fn git_works_in_a_mounted_workspace() {
-    let Some(mut fixture) = fixture() else { return };
+fn git_works_in_a_mounted_workspace(frontend: Frontend) {
+    let Some(mut fixture) = fixture(frontend) else {
+        return;
+    };
     if Command::new("git").arg("--version").output().is_err() {
         return; // git is not installed
     }
@@ -211,11 +249,12 @@ fn git_works_in_a_mounted_workspace() {
     assert!(listing(&root).is_empty(), "unmounted");
 }
 
-#[test]
-fn hard_links_share_one_file() {
+fn hard_links_share_one_file(frontend: Frontend) {
     use std::os::unix::fs::MetadataExt;
 
-    let Some(fixture) = fixture() else { return };
+    let Some(fixture) = fixture(frontend) else {
+        return;
+    };
     let root = &fixture.root;
 
     // A committed file is copied up, then linked; writes show through both paths.
@@ -276,11 +315,12 @@ fn hard_links_share_one_file() {
     assert_eq!(fs::metadata(root.join("src/lib.rs")).unwrap().nlink(), 1);
 }
 
-#[test]
-fn files_the_mount_holds_open_follow_changes_through_the_api() {
+fn files_the_mount_holds_open_follow_changes_through_the_api(frontend: Frontend) {
     use std::os::unix::fs::FileExt;
 
-    let Some(fixture) = fixture() else { return };
+    let Some(fixture) = fixture(frontend) else {
+        return;
+    };
     let root = &fixture.root;
     let api_read = |path: &str| {
         let space = fixture.space.lock().unwrap();
@@ -328,9 +368,10 @@ fn files_the_mount_holds_open_follow_changes_through_the_api() {
     assert_eq!(fs::read_to_string(&notes).unwrap(), "five\n");
 }
 
-#[test]
-fn the_mount_shows_a_restored_snapshot() {
-    let Some(fixture) = fixture() else { return };
+fn the_mount_shows_a_restored_snapshot(frontend: Frontend) {
+    let Some(fixture) = fixture(frontend) else {
+        return;
+    };
     let root = &fixture.root;
     let snapshot = || {
         let mut space = fixture.space.lock().unwrap();

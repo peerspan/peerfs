@@ -1,6 +1,7 @@
 [package]
 name = "nfsserve"
-# Hugging Face's nfsserve 0.11.0 (https://github.com/huggingface/nfsserve), vendored.
+# Hugging Face's nfsserve 0.11.0 (https://github.com/huggingface/nfsserve), vendored with
+# LINK, COMMIT and unstable writes added; see PEERFS.md.
 version = "0.11.0"
 edition = "2021"
 authors = ["Rajat Arya <rajat@huggingface.co>", "Assaf Vayner <assaf@huggingface.co>"]

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::context::RPCContext;
 use crate::rpcwire::*;
@@ -23,6 +23,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
+    reserved_ports_only: bool,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -159,6 +160,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            reserved_ports_only: false,
         })
     }
 
@@ -170,6 +172,13 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
     /// Default path is `/` if not set.
     pub fn with_export_name<S: AsRef<str>>(&mut self, export_name: S) {
         self.export_name = Arc::new(format!("/{}", export_name.as_ref().trim_end_matches('/').trim_start_matches('/')))
+    }
+
+    /// Accepts connections only from reserved ports (below 1024), which on Unix only a
+    /// privileged process, such as the kernel's NFS client, can bind. Other local
+    /// processes, which could claim any user under AUTH_UNIX, are refused.
+    pub fn with_reserved_ports_only(&mut self) {
+        self.reserved_ports_only = true;
     }
 }
 
@@ -195,7 +204,11 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
     /// Loops forever and never returns handling all incoming connections.
     async fn handle_forever(&self) -> io::Result<()> {
         loop {
-            let (socket, _) = self.listener.accept().await?;
+            let (socket, peer) = self.listener.accept().await?;
+            if self.reserved_ports_only && peer.port() >= 1024 {
+                warn!("Refusing connection from unreserved port {}", peer);
+                continue;
+            }
             let context = RPCContext {
                 local_port: self.port,
                 client_addr: socket.peer_addr().unwrap().to_string(),

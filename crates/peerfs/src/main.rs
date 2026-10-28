@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use peerfs_api::{
-    Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitResponse, EntryKind, GcRequest,
-    GcResponse, MergeResponse, Revision, SnapshotResponse,
+    Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitResponse, EntryKind, Frontend,
+    GcRequest, GcResponse, MergeResponse, Revision, SnapshotResponse,
 };
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
@@ -221,7 +221,13 @@ enum WorkspaceCommand {
     Merge { name: String, revision: String },
     /// Mount the workspace at an empty directory, served by the space's server until
     /// unmounted or the server stops.
-    Mount { name: String, dir: PathBuf },
+    Mount {
+        name: String,
+        dir: PathBuf,
+        /// Serve it over loopback NFS instead of FUSE, as on macOS.
+        #[arg(long)]
+        nfs: bool,
+    },
     /// Unmount the workspace. Files still open there stop working.
     Unmount { name: String },
     /// Delete a workspace and its uncommitted changes.
@@ -673,8 +679,9 @@ async fn workspace(
                 }
             }
         }
-        WorkspaceCommand::Mount { name, dir } => {
-            let mount = client.mount(&name, &absolute(&dir)?).await?;
+        WorkspaceCommand::Mount { name, dir, nfs } => {
+            let frontend = if nfs { Frontend::Nfs } else { Frontend::Fuse };
+            let mount = client.mount(&name, &absolute(&dir)?, frontend).await?;
             writeln!(out, "{} mounted at {}", mount.workspace, mount.path)?;
         }
         WorkspaceCommand::Unmount { name } => client.unmount(&name).await?,
