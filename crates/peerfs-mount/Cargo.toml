@@ -1,6 +1,6 @@
 [package]
 name = "peerfs-mount"
-description = "A peerfs workspace as a FUSE or loopback NFS file system"
+description = "A peerfs workspace as a FUSE, loopback NFS or vhost-user-fs file system"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,9 +14,16 @@ libc.workspace = true
 nfsserve.workspace = true
 peerfs-core.workspace = true
 tokio.workspace = true
+vhost.workspace = true
+vhost-user-backend.workspace = true
+virtio-bindings.workspace = true
+virtio-queue.workspace = true
+vm-memory.workspace = true
+vmm-sys-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+vhost = { workspace = true, features = ["vhost-user-frontend"] }
 
 [lints]
 workspace = true

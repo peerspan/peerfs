@@ -219,19 +219,31 @@ enum WorkspaceCommand {
     },
     /// Merge a branch, or `<host>/<branch>`, into the branch the workspace follows.
     Merge { name: String, revision: String },
-    /// Mount the workspace at an empty directory, served by the space's server until
-    /// unmounted or the server stops.
-    Mount {
-        name: String,
-        dir: PathBuf,
-        /// Serve it over loopback NFS instead of FUSE, as on macOS.
-        #[arg(long)]
-        nfs: bool,
-    },
+    /// Mount the workspace at an empty directory, or serve it to a virtual machine at a
+    /// socket, from the space's server until unmounted or the server stops.
+    Mount(MountArgs),
     /// Unmount the workspace. Files still open there stop working.
     Unmount { name: String },
     /// Delete a workspace and its uncommitted changes.
     Discard { name: String },
+}
+
+/// `ws mount`'s arguments.
+#[derive(Debug, clap::Args)]
+struct MountArgs {
+    name: String,
+    /// The directory, or with `--vhost-user` the socket to create.
+    dir: PathBuf,
+    /// Serve it over loopback NFS instead of FUSE, as on macOS.
+    #[arg(long, conflicts_with = "vhost_user")]
+    nfs: bool,
+    /// Serve it to a virtual machine instead, as a vhost-user-fs device at the socket `DIR`,
+    /// which a VMM connects to as it would to `virtiofsd`.
+    #[arg(long)]
+    vhost_user: bool,
+    /// With `--vhost-user`, the tag the guest mounts it by; the workspace's name if not given.
+    #[arg(long, requires = "vhost_user")]
+    tag: Option<String>,
 }
 
 fn hostname() -> String {
@@ -549,6 +561,25 @@ fn author(commit: &CommitInfo) -> String {
     who
 }
 
+/// `ws mount`: mounts through the front end the flags pick, FUSE by default.
+async fn mount(client: &Client, args: &MountArgs, out: &mut impl Write) -> Result<()> {
+    let frontend = match (args.nfs, args.vhost_user) {
+        (true, _) => Frontend::Nfs,
+        (_, true) => Frontend::VhostUser,
+        _ => Frontend::Fuse,
+    };
+    let mount = client
+        .mount(
+            &args.name,
+            &absolute(&args.dir)?,
+            frontend,
+            args.tag.as_deref(),
+        )
+        .await?;
+    writeln!(out, "{} mounted at {}", mount.workspace, mount.path)?;
+    Ok(())
+}
+
 /// `ws snapshots`: one line per snapshot, newest first, with who took it.
 async fn print_snapshots(client: &Client, name: &str, out: &mut impl Write) -> Result<()> {
     for snapshot in client.snapshots(name).await? {
@@ -679,11 +710,7 @@ async fn workspace(
                 }
             }
         }
-        WorkspaceCommand::Mount { name, dir, nfs } => {
-            let frontend = if nfs { Frontend::Nfs } else { Frontend::Fuse };
-            let mount = client.mount(&name, &absolute(&dir)?, frontend).await?;
-            writeln!(out, "{} mounted at {}", mount.workspace, mount.path)?;
-        }
+        WorkspaceCommand::Mount(args) => mount(client, &args, out).await?,
         WorkspaceCommand::Unmount { name } => client.unmount(&name).await?,
         WorkspaceCommand::Snapshot { name, message } => {
             if let SnapshotResponse::Snapshot { snapshot } =

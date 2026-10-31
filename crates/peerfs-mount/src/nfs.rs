@@ -212,15 +212,14 @@ impl NFSFileSystem for NfsFs {
         max_entries: usize,
     ) -> Result<ReadDirResult, nfsstat3> {
         let entries = self.fs.entries(dirid).map_err(|e| to_status(&e))?;
-        // `.` and `..` come first; NFS clients make their own.
-        let mut entries = entries.into_iter().skip(2).peekable();
-        if start_after != 0 {
-            // The cookie is the last number the client saw. The paths of a hard link in one
-            // directory share a number, so a page ending between them repeats the second.
-            if !entries.any(|(number, _, _)| number == start_after) {
-                return Err(nfsstat3::NFS3ERR_BAD_COOKIE);
-            }
-        }
+        // `.` and `..` come first; NFS clients make their own. The rest are in order of
+        // number, and the cookie is the last number the client saw, so a listing resumes
+        // after it even if that entry has since been removed.
+        let mut entries = entries
+            .into_iter()
+            .skip(2)
+            .filter(|(number, _, _)| *number > start_after)
+            .peekable();
         let mut result = ReadDirResult::default();
         while result.entries.len() < max_entries {
             let Some((fileid, _, name)) = entries.next() else {

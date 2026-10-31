@@ -635,24 +635,28 @@ impl Client {
         self.json(Method::POST, &path, Some(&request)).await
     }
 
-    /// Mounts a workspace at `path`, an absolute, empty directory on the server's host,
-    /// through `frontend`.
+    /// Mounts a workspace at `path` on the server's host through `frontend`: an absolute,
+    /// empty directory, or for vhost-user the socket to create, which the guest mounts by
+    /// `tag` (the workspace's name if `None`).
     ///
     /// # Errors
     ///
     /// Fails with `conflict` if the workspace is mounted already, `invalid` for a path that
-    /// is not an empty directory, or `internal` if the kernel refuses the mount.
+    /// is not an empty directory, a socket that exists or a bad tag, or `internal` if the
+    /// kernel refuses the mount.
     pub async fn mount(
         &self,
         workspace: &str,
         path: &str,
         frontend: Frontend,
+        tag: Option<&str>,
     ) -> Result<MountInfo, ClientError> {
         let route = format!("/v1/workspaces/{}/mount", segment(workspace));
         let request = MountInfo {
             workspace: String::new(),
             path: path.to_owned(),
             frontend,
+            tag: tag.map(str::to_owned),
         };
         self.json(Method::POST, &route, Some(&request)).await
     }

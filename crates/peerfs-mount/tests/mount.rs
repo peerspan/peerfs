@@ -22,8 +22,9 @@ fn author() -> Author {
     }
 }
 
-/// Whether this machine lets the test mount through `frontend`.
-fn available(frontend: Frontend) -> bool {
+/// Whether this machine lets the test mount through `frontend`, which must be one the
+/// host's kernel mounts.
+fn available(frontend: &Frontend) -> bool {
     match frontend {
         Frontend::Fuse => fs::OpenOptions::new()
             .read(true)
@@ -38,6 +39,7 @@ fn available(frontend: Frontend) -> bool {
                 .iter()
                 .any(|helper| Path::new(helper).exists())
         }
+        Frontend::VhostUser { .. } => false,
     }
 }
 
@@ -59,6 +61,7 @@ per_frontend!(
     hard_links_share_one_file,
     files_the_mount_holds_open_follow_changes_through_the_api,
     the_mount_shows_a_restored_snapshot,
+    a_large_directory_is_removed_while_it_is_listed,
 );
 
 struct Fixture {
@@ -71,7 +74,7 @@ struct Fixture {
 /// A space whose `main` holds `src/lib.rs`, `run.sh` (executable) and `docs/a.md`, with
 /// workspace `w` mounted through `frontend`.
 fn fixture(frontend: Frontend) -> Option<Fixture> {
-    if !available(frontend) {
+    if !available(&frontend) {
         // This machine cannot mount this way; there is nothing to test.
         return None;
     }
@@ -423,4 +426,22 @@ fn the_mount_shows_a_restored_snapshot(frontend: Frontend) {
         ws.read(&space, "src/lib.rs").unwrap(),
         b"pub fn four() {}\n"
     );
+}
+
+fn a_large_directory_is_removed_while_it_is_listed(frontend: Frontend) {
+    let Some(fixture) = fixture(frontend) else {
+        return;
+    };
+    let dir = fixture.root.join("many");
+    fs::create_dir(&dir).unwrap();
+    for i in 0..1000 {
+        fs::write(dir.join(format!("file-with-a-longer-name-{i}")), "x").unwrap();
+    }
+    // Removing each entry as the listing returns it, as busybox's `rm -rf` does, must not
+    // skip any.
+    for entry in fs::read_dir(&dir).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    assert!(listing(&dir).is_empty(), "{} left", listing(&dir).len());
+    fs::remove_dir(&dir).unwrap();
 }

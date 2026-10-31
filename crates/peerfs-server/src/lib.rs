@@ -179,7 +179,7 @@ pub async fn serve(space: Space, options: Options) -> io::Result<()> {
         .with_graceful_shutdown(shutdown(stop))
         .await;
     let mounts = std::mem::take(&mut *lock_mounts(&state));
-    for (workspace, mount) in mounts {
+    for (workspace, mut mount) in mounts {
         if let Err(e) = mount.unmount() {
             log_internal(&format!("unmounting workspace {workspace}: {e}"));
         }
@@ -1018,12 +1018,17 @@ async fn mount_workspace(
         let frontend = match request.frontend {
             Frontend::Fuse => MountFrontend::Fuse,
             Frontend::Nfs => MountFrontend::Nfs,
+            Frontend::VhostUser => MountFrontend::VhostUser {
+                tag: request.tag.clone().unwrap_or_else(|| name.clone()),
+            },
         };
         let mount = Mount::new(Arc::clone(&shared.space), &name, &path, frontend).map_err(|e| {
             match e.kind() {
                 io::ErrorKind::NotFound
                 | io::ErrorKind::DirectoryNotEmpty
-                | io::ErrorKind::NotADirectory => {
+                | io::ErrorKind::NotADirectory
+                | io::ErrorKind::AlreadyExists
+                | io::ErrorKind::InvalidInput => {
                     ApiError::invalid(format!("{}: {e}", path.display()))
                 }
                 _ => ApiError::internal(&format!("mounting at {}: {e}", path.display())),
@@ -1041,16 +1046,31 @@ async fn unmount_workspace(
     State(state): State<AppState>,
     UrlPath(name): UrlPath<String>,
 ) -> ApiResult<StatusCode> {
-    let Some(mount) = lock_mounts(&state).remove(&name) else {
+    let Some(mut mount) = lock_mounts(&state).remove(&name) else {
         return Err(ApiError::not_found(format!(
             "workspace {name} is not mounted"
         )));
     };
-    tokio::task::spawn_blocking(move || mount.unmount())
-        .await
-        .map_err(|e| ApiError::internal(&e))?
-        .map_err(|e| ApiError::internal(&format!("unmounting {name}: {e}")))?;
-    Ok(StatusCode::NO_CONTENT)
+    let (mount, unmounted) = tokio::task::spawn_blocking(move || {
+        let unmounted = mount.unmount();
+        (mount, unmounted)
+    })
+    .await
+    .map_err(|e| ApiError::internal(&e))?;
+    match unmounted {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => {
+            // Still mounted, so still this server's to serve and unmount later.
+            lock_mounts(&state).insert(name.clone(), mount);
+            if e.kind() == io::ErrorKind::ResourceBusy {
+                Err(ApiError::conflict(format!(
+                    "workspace {name} is in use: {e}"
+                )))
+            } else {
+                Err(ApiError::internal(&format!("unmounting {name}: {e}")))
+            }
+        }
+    }
 }
 
 async fn mounts(State(state): State<AppState>) -> ApiResult<Json<Vec<MountInfo>>> {
@@ -1066,9 +1086,14 @@ fn mount_info(workspace: &str, mount: &Mount) -> MountInfo {
     MountInfo {
         workspace: workspace.to_owned(),
         path: mount.path().display().to_string(),
+        tag: match mount.frontend() {
+            MountFrontend::VhostUser { tag } => Some(tag),
+            _ => None,
+        },
         frontend: match mount.frontend() {
             MountFrontend::Fuse => Frontend::Fuse,
             MountFrontend::Nfs => Frontend::Nfs,
+            MountFrontend::VhostUser { .. } => Frontend::VhostUser,
         },
     }
 }

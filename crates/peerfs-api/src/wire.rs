@@ -169,6 +169,10 @@ pub struct MountInfo {
     /// How it is mounted; FUSE when not given.
     #[serde(default)]
     pub frontend: Frontend,
+    /// For `vhost-user`, the virtio-fs tag the guest mounts it by; the workspace's name
+    /// when not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 /// How a workspace is mounted.
@@ -180,6 +184,10 @@ pub enum Frontend {
     Fuse,
     /// An NFS version 3 server on the loopback interface, mounted by the kernel's client.
     Nfs,
+    /// A vhost-user-fs device for virtual machines: `path` is the Unix socket a VMM connects
+    /// to, as it would to `virtiofsd`.
+    #[serde(rename = "vhost-user")]
+    VhostUser,
 }
 
 /// `POST /v1/workspaces`: create a workspace following a branch.

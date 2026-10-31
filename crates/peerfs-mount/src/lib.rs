@@ -1,8 +1,9 @@
-//! A peerfs workspace as a file system, served over FUSE or loopback NFS.
+//! A peerfs workspace as a file system, served over FUSE, loopback NFS or vhost-user-fs.
 //!
 //! [`WorkspaceFs`] implements fuse-backend-rs's `FileSystem` on top of a [`Workspace`], so
 //! the same code serves `/dev/fuse` on Linux and, later, vhost-user-fs for VMs. The NFS
-//! server, for macOS, answers with the same code; see [`Frontend::Nfs`]. Every operation
+//! server, for macOS, and the vhost-user-fs device, for virtual machines, answer with the
+//! same code; see [`Frontend`]. Every operation
 //! takes the space's lock, so the mount and the local API see one workspace.
 //!
 //! - Reads come from the overlay's real file, or from the store for a file only in the
@@ -50,6 +51,7 @@ use peerfs_core::{
 };
 
 mod nfs;
+mod vhost;
 
 /// How long the kernel may cache names and attributes. Short, because the local API can
 /// change the workspace underneath the mount.
@@ -322,6 +324,11 @@ impl WorkspaceFs {
         }
     }
 
+    /// The same file system, showing every file as owned by `uid` and `gid`.
+    fn owned_by(self, uid: u32, gid: u32) -> Self {
+        Self { uid, gid, ..self }
+    }
+
     /// Runs `work` with the space, a fresh view of the workspace, and the mount's state.
     fn with<T>(
         &self,
@@ -500,7 +507,13 @@ impl WorkspaceFs {
         })
     }
 
-    /// The directory `inode`'s entries, `.` and `..` first: inode number, type and name.
+    /// The directory `inode`'s entries, `.` and `..` first, then the rest by inode number:
+    /// inode number, type and name.
+    ///
+    /// Inode numbers are given in increasing order and stay with a path, so a listing read
+    /// in pages resumes after the last number it returned and neither skips nor repeats an
+    /// entry when others are removed between pages, as `rm -rf` does. The paths of a hard link
+    /// in one directory share a number, so a page ending between them skips the second.
     fn entries(&self, inode: u64) -> io::Result<Vec<(u64, u8, Vec<u8>)>> {
         self.with(|space, workspace, state| {
             let path = state.inodes.path(inode)?;
@@ -520,6 +533,7 @@ impl WorkspaceFs {
                 };
                 entries.push((state.inodes.number(&child), kind, name.into_bytes()));
             }
+            entries[2..].sort_by_key(|(number, _, _)| *number);
             Ok(entries)
         })
     }
@@ -846,12 +860,16 @@ impl FileSystem for WorkspaceFs {
         add_entry: &mut dyn FnMut(DirEntry<'_>) -> io::Result<usize>,
     ) -> io::Result<()> {
         let entries = self.entries(inode)?;
-        for (index, (ino, kind, name)) in
-            entries.iter().enumerate().skip(to_usize_saturating(offset))
-        {
+        // An entry's offset, which the next read resumes after: 1 for `.`, 2 for `..`, and
+        // past those the inode number, offset by 2.
+        let offsets = (1..=2).chain(entries[2..].iter().map(|(ino, _, _)| ino + 2));
+        for ((ino, kind, name), at) in entries.iter().zip(offsets) {
+            if at <= offset {
+                continue;
+            }
             let added = add_entry(DirEntry {
                 ino: *ino,
-                offset: len_u64(index + 1),
+                offset: at,
                 type_: u32::from(*kind),
                 name,
             })?;
@@ -864,7 +882,7 @@ impl FileSystem for WorkspaceFs {
 }
 
 /// How a workspace is mounted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Frontend {
     /// FUSE, on Linux.
     #[default]
@@ -872,6 +890,13 @@ pub enum Frontend {
     /// An NFS version 3 server on the loopback interface, mounted by the kernel's client: for
     /// macOS, and testable on Linux. Mounting needs the privileges `mount` needs.
     Nfs,
+    /// A vhost-user-fs device for virtual machines, served at a Unix socket that a VMM
+    /// connects to, as it would to `virtiofsd`. The guest mounts it as virtio-fs by `tag`,
+    /// and sees every file as its root's.
+    VhostUser {
+        /// The tag, 1 to 36 bytes.
+        tag: String,
+    },
 }
 
 /// A workspace mounted at a directory, served by threads of this process. Dropping it
@@ -887,22 +912,27 @@ enum Served {
         threads: Vec<JoinHandle<()>>,
     },
     Nfs(nfs::NfsMount),
+    VhostUser {
+        mount: vhost::VhostUserMount,
+        tag: String,
+    },
 }
 
 impl Mount {
-    /// Mounts `workspace` of `space` at `path`, an existing empty directory, through
-    /// `frontend`.
+    /// Mounts `workspace` of `space` at `path` through `frontend`: for FUSE and NFS an
+    /// existing empty directory, for vhost-user the socket to create.
     ///
     /// # Errors
     ///
-    /// Fails if `path` is not an empty directory, or the kernel refuses the mount.
+    /// Fails if `path` is not an empty directory, or for vhost-user exists already or the tag
+    /// is not 1 to 36 bytes, or if the kernel refuses the mount.
     pub fn new(
         space: Arc<Mutex<Space>>,
         workspace: &str,
         path: &Path,
         frontend: Frontend,
     ) -> io::Result<Self> {
-        if fs::read_dir(path)?.next().is_some() {
+        if !matches!(frontend, Frontend::VhostUser { .. }) && fs::read_dir(path)?.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::DirectoryNotEmpty,
                 format!("{} is not empty", path.display()),
@@ -912,6 +942,10 @@ impl Mount {
         let served = match frontend {
             Frontend::Fuse => mount_fuse(fs, workspace, path)?,
             Frontend::Nfs => Served::Nfs(nfs::NfsMount::new(fs, workspace, path)?),
+            Frontend::VhostUser { tag } => Served::VhostUser {
+                mount: vhost::VhostUserMount::new(fs.owned_by(0, 0), path, &tag)?,
+                tag,
+            },
         };
         Ok(Self {
             path: path.to_owned(),
@@ -919,25 +953,28 @@ impl Mount {
         })
     }
 
-    /// Where the workspace is mounted.
+    /// Where the workspace is mounted: a directory, or for vhost-user the socket.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// How the workspace is mounted.
     pub fn frontend(&self) -> Frontend {
-        match self.served {
+        match &self.served {
             Served::Fuse { .. } => Frontend::Fuse,
             Served::Nfs(_) => Frontend::Nfs,
+            Served::VhostUser { tag, .. } => Frontend::VhostUser { tag: tag.clone() },
         }
     }
 
-    /// Unmounts and waits for the serving threads to finish.
+    /// Unmounts and waits for the serving threads to finish. After a failure the mount is
+    /// as it was, so it can be tried again; after success, again does nothing.
     ///
     /// # Errors
     ///
-    /// Fails if the kernel refuses to unmount, as when a process has a file open there.
-    pub fn unmount(mut self) -> io::Result<()> {
+    /// Fails if the kernel refuses to unmount, as when a process has a file open there, or
+    /// for vhost-user while a virtual machine is connected.
+    pub fn unmount(&mut self) -> io::Result<()> {
         self.stop()
     }
 
@@ -958,6 +995,7 @@ impl Mount {
                 Ok(())
             }
             Served::Nfs(mount) => mount.stop(&self.path),
+            Served::VhostUser { mount, .. } => mount.stop(),
         }
     }
 }
