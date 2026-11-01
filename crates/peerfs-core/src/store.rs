@@ -77,6 +77,16 @@ pub(crate) struct Store {
     packs: Vec<u32>,
     open: Option<OpenPack>,
     new_pack: bool,
+    access: Access,
+}
+
+/// Whether a store may be written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Access {
+    /// Objects can be stored, and a partial record at the end of the newest pack is cut off.
+    ReadWrite,
+    /// Only reads: a partial record at the end is left for the writer and ignored.
+    ReadOnly,
 }
 
 fn pack_name(sequence: u32) -> String {
@@ -95,9 +105,11 @@ fn to_usize(value: u64) -> usize {
 }
 
 impl Store {
-    /// Opens the store in `dir`, creating it if needed, and indexes every pack.
-    pub(crate) fn open(dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir).map_err(|e| Error::io("creating", dir, e))?;
+    /// Opens the store in `dir`, creating it if needed and writable, and indexes every pack.
+    pub(crate) fn open(dir: &Path, access: Access) -> Result<Self> {
+        if access == Access::ReadWrite {
+            fs::create_dir_all(dir).map_err(|e| Error::io("creating", dir, e))?;
+        }
         let mut packs = Vec::new();
         for entry in fs::read_dir(dir).map_err(|e| Error::io("listing", dir, e))? {
             let entry = entry.map_err(|e| Error::io("listing", dir, e))?;
@@ -109,10 +121,10 @@ impl Store {
         let mut index = HashMap::new();
         let newest = packs.last().copied();
         for &sequence in &packs {
-            let tail = if Some(sequence) == newest {
-                Tail::Newest
-            } else {
-                Tail::Sealed
+            let tail = match (Some(sequence) == newest, access) {
+                (true, Access::ReadWrite) => Tail::Newest,
+                (true, Access::ReadOnly) => Tail::Writing,
+                (false, _) => Tail::Sealed,
             };
             scan(dir, &mut index, sequence, tail)?;
         }
@@ -122,6 +134,7 @@ impl Store {
             packs,
             open: None,
             new_pack: false,
+            access,
         })
     }
 
@@ -147,6 +160,12 @@ impl Store {
         let id = ObjectId::compute(kind, bytes);
         if self.contains(&id) {
             return Ok(id);
+        }
+        if self.access == Access::ReadOnly {
+            return Err(Error::Unsupported {
+                path: self.dir.clone(),
+                reason: "this view of the store is read-only",
+            });
         }
         let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL)
             .map_err(|e| Error::io("compressing", &self.dir, e))?;
@@ -495,6 +514,9 @@ fn records(dir: &Path, sequence: u32) -> Result<Vec<Record>> {
 enum Tail {
     /// The newest pack: a partial record is cut off.
     Newest,
+    /// The newest pack, which another process may be appending to: a partial record is
+    /// ignored.
+    Writing,
     /// An older pack: a partial record means corruption.
     Sealed,
 }
@@ -509,7 +531,7 @@ fn scan(
     let path = dir.join(pack_name(sequence));
     let file = OpenOptions::new()
         .read(true)
-        .write(true)
+        .write(tail == Tail::Newest)
         .open(&path)
         .map_err(|e| Error::io("opening", &path, e))?;
     let len = file
@@ -526,11 +548,15 @@ fn scan(
                 offset + len_u64(HEADER_LEN) + u64::from(payload) <= len
             };
         if !complete {
-            if tail == Tail::Sealed {
-                return Err(Error::Corrupt(format!(
-                    "{} ends in a partial record at {offset}",
-                    path.display()
-                )));
+            match tail {
+                Tail::Sealed => {
+                    return Err(Error::Corrupt(format!(
+                        "{} ends in a partial record at {offset}",
+                        path.display()
+                    )));
+                }
+                Tail::Writing => break,
+                Tail::Newest => {}
             }
             file.set_len(offset)
                 .and_then(|()| file.sync_all())
@@ -580,7 +606,7 @@ mod tests {
     #[test]
     fn objects_survive_reopening_and_a_torn_tail_is_cut() {
         let dir = tempfile::tempdir().expect("temporary directory");
-        let mut store = Store::open(dir.path()).expect("open");
+        let mut store = Store::open(dir.path(), Access::ReadWrite).expect("open");
         let a = store.put(Kind::Blob, b"first").expect("put");
         let b = store.put(Kind::Blob, &[7; 10_000]).expect("put");
         store.sync().expect("sync");
@@ -591,7 +617,7 @@ mod tests {
         file.write_all(&[200, 0, 0, 0, 1, 0]).expect("torn record");
         drop(file);
 
-        let store = Store::open(dir.path()).expect("reopen");
+        let store = Store::open(dir.path(), Access::ReadWrite).expect("reopen");
         assert_eq!(store.len(), 2);
         assert_eq!(
             store.get(&a).expect("read"),
@@ -606,7 +632,7 @@ mod tests {
     #[test]
     fn compaction_drops_the_dead_and_a_crash_midway_loses_nothing() {
         let dir = tempfile::tempdir().expect("temporary directory");
-        let mut store = Store::open(dir.path()).expect("open");
+        let mut store = Store::open(dir.path(), Access::ReadWrite).expect("open");
         let kept = store.put(Kind::Blob, b"kept").expect("put");
         let dead = store.put(Kind::Blob, &[9; 5_000]).expect("put");
         store.sync().expect("sync");
@@ -633,16 +659,37 @@ mod tests {
         // As if the crash came after the new pack was written but before the old one was
         // removed: both hold the kept object.
         fs::write(&old_pack, saved).expect("restore old pack");
-        let store = Store::open(dir.path()).expect("reopen");
+        let store = Store::open(dir.path(), Access::ReadWrite).expect("reopen");
         for id in [kept, dead, after] {
             assert!(store.get(&id).expect("read").is_some());
         }
     }
 
     #[test]
+    fn a_read_only_view_ignores_a_partial_tail_and_stores_nothing() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let mut store = Store::open(dir.path(), Access::ReadWrite).expect("open");
+        let id = store.put(Kind::Blob, b"stored").expect("put");
+        store.sync().expect("sync");
+        let pack = dir.path().join(pack_name(0));
+        let whole = fs::metadata(&pack).expect("pack").len();
+        // As if the writer were in the middle of appending a record.
+        let mut file = OpenOptions::new().append(true).open(&pack).expect("pack");
+        file.write_all(&[9; 10]).expect("append");
+
+        let mut view = Store::open(dir.path(), Access::ReadOnly).expect("open read-only");
+        assert!(view.get(&id).expect("read").is_some());
+        assert_eq!(fs::metadata(&pack).expect("pack").len(), whole + 10);
+        assert!(matches!(
+            view.put(Kind::Blob, b"new"),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+
+    #[test]
     fn a_flipped_byte_is_reported_not_returned() {
         let dir = tempfile::tempdir().expect("temporary directory");
-        let mut store = Store::open(dir.path()).expect("open");
+        let mut store = Store::open(dir.path(), Access::ReadWrite).expect("open");
         let id = store
             .put(Kind::Blob, b"some incompressible text")
             .expect("put");

@@ -4,8 +4,10 @@
 //! server. When none is running, the command starts one in the background, which exits
 //! after ten idle minutes or on `peerfs stop`.
 
+mod confine;
 mod hook;
 mod stop;
+mod vm;
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -147,6 +149,9 @@ enum Command {
     /// Run as an agent's hook.
     #[command(subcommand)]
     Hook(HookCommand),
+    /// The confined process `ws vhost-user` becomes.
+    #[command(hide = true, name = "serve-vm")]
+    ServeVm(vm::ServeVmArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -219,9 +224,13 @@ enum WorkspaceCommand {
     },
     /// Merge a branch, or `<host>/<branch>`, into the branch the workspace follows.
     Merge { name: String, revision: String },
-    /// Mount the workspace at an empty directory, or serve it to a virtual machine at a
-    /// socket, from the space's server until unmounted or the server stops.
+    /// Mount the workspace at an empty directory, from the space's server until unmounted
+    /// or the server stops.
     Mount(MountArgs),
+    /// Serve the workspace to one virtual machine as a vhost-user-fs device at a socket,
+    /// from a confined process, until the VMM disconnects. The server leaves the workspace
+    /// alone meanwhile.
+    VhostUser(vm::VhostUserArgs),
     /// Unmount the workspace. Files still open there stop working.
     Unmount { name: String },
     /// Delete a workspace and its uncommitted changes.
@@ -232,18 +241,11 @@ enum WorkspaceCommand {
 #[derive(Debug, clap::Args)]
 struct MountArgs {
     name: String,
-    /// The directory, or with `--vhost-user` the socket to create.
+    /// The directory.
     dir: PathBuf,
     /// Serve it over loopback NFS instead of FUSE, as on macOS.
-    #[arg(long, conflicts_with = "vhost_user")]
-    nfs: bool,
-    /// Serve it to a virtual machine instead, as a vhost-user-fs device at the socket `DIR`,
-    /// which a VMM connects to as it would to `virtiofsd`.
     #[arg(long)]
-    vhost_user: bool,
-    /// With `--vhost-user`, the tag the guest mounts it by; the workspace's name if not given.
-    #[arg(long, requires = "vhost_user")]
-    tag: Option<String>,
+    nfs: bool,
 }
 
 fn hostname() -> String {
@@ -254,10 +256,21 @@ fn hostname() -> String {
         .unwrap_or_else(|| "localhost".to_owned())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli).await {
+    let result = match &cli.command {
+        // Before any thread starts, so that the process can confine itself.
+        Command::ServeVm(args) => std::path::absolute(&cli.space)
+            .context("resolving the space")
+            .and_then(|space_dir| vm::serve(&space_dir, args))
+            .map(|()| ExitCode::SUCCESS),
+        _ => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("starting the async runtime")
+            .and_then(|runtime| runtime.block_on(run(cli))),
+    };
+    match result {
         Ok(code) => code,
         Err(error) => {
             let _ = writeln!(io::stderr().lock(), "peerfs: {error:#}");
@@ -335,6 +348,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             )
             .await?;
             Ok(ExitCode::SUCCESS)
+        }
+        Command::ServeVm(_) => unreachable!("served before the async runtime starts"),
+        Command::Workspace(WorkspaceCommand::VhostUser(args)) => {
+            let client = connect(&space_dir, cli.host.as_deref()).await?;
+            vm::lend_and_serve(&client, &space_dir, args).await?;
+            unreachable!("lend_and_serve returns only on failure")
         }
         command => {
             let client = connect(&space_dir, cli.host.as_deref()).await?;
@@ -423,7 +442,11 @@ async fn client_command(
     out: &mut impl Write,
 ) -> Result<ExitCode> {
     match command {
-        Command::Init | Command::Serve { .. } | Command::Stop | Command::Hook(_) => {
+        Command::Init
+        | Command::Serve { .. }
+        | Command::Stop
+        | Command::Hook(_)
+        | Command::ServeVm(_) => {
             unreachable!("handled without a client")
         }
         Command::Import {
@@ -563,18 +586,13 @@ fn author(commit: &CommitInfo) -> String {
 
 /// `ws mount`: mounts through the front end the flags pick, FUSE by default.
 async fn mount(client: &Client, args: &MountArgs, out: &mut impl Write) -> Result<()> {
-    let frontend = match (args.nfs, args.vhost_user) {
-        (true, _) => Frontend::Nfs,
-        (_, true) => Frontend::VhostUser,
-        _ => Frontend::Fuse,
+    let frontend = if args.nfs {
+        Frontend::Nfs
+    } else {
+        Frontend::Fuse
     };
     let mount = client
-        .mount(
-            &args.name,
-            &absolute(&args.dir)?,
-            frontend,
-            args.tag.as_deref(),
-        )
+        .mount(&args.name, &absolute(&args.dir)?, frontend)
         .await?;
     writeln!(out, "{} mounted at {}", mount.workspace, mount.path)?;
     Ok(())
@@ -711,6 +729,7 @@ async fn workspace(
             }
         }
         WorkspaceCommand::Mount(args) => mount(client, &args, out).await?,
+        WorkspaceCommand::VhostUser(_) => unreachable!("handled before connecting"),
         WorkspaceCommand::Unmount { name } => client.unmount(&name).await?,
         WorkspaceCommand::Snapshot { name, message } => {
             if let SnapshotResponse::Snapshot { snapshot } =

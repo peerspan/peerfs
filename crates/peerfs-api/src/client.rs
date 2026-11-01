@@ -1,11 +1,14 @@
 //! A client of the local API over its Unix socket.
 
 use std::fmt::Write;
+use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::header::{CONTENT_TYPE, HOST};
+use hyper::header::{CONNECTION, CONTENT_TYPE, HOST, UPGRADE};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
@@ -16,9 +19,10 @@ use crate::wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
     Frontend, GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey, ImportRequest,
-    MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
-    ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SnapshotRequest, SnapshotResponse,
-    SpaceInfo, TrackingInfo, WorkspaceInfo,
+    LEASE_PROTOCOL, LEASE_RETURN, LEASE_RETURNED, MergeRequest, MergeResponse, MountInfo,
+    PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, RestoreRequest,
+    RestoreResponse, Revision, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo,
+    WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -74,6 +78,71 @@ pub struct RawResponse {
     pub status: u16,
     /// The body.
     pub body: Bytes,
+}
+
+/// The error a server's error response describes.
+fn api_error(response: &RawResponse) -> ClientError {
+    match serde_json::from_slice::<ErrorBody>(&response.body) {
+        Ok(error) => ClientError::Api {
+            status: response.status,
+            code: error.code,
+            error: error.error,
+        },
+        Err(_) => ClientError::Decode(format!(
+            "status {} with body {:?}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        )),
+    }
+}
+
+/// A workspace the server has lent to this process, for as long as the lease's connection
+/// stays open; see [`LEASE_PROTOCOL`]. The connection is a plain descriptor, so a process
+/// can hand it on, as to a program it executes.
+#[derive(Debug)]
+pub struct Lease {
+    stream: StdUnixStream,
+}
+
+impl Lease {
+    /// The lease whose connection is `fd`.
+    pub fn from_fd(fd: OwnedFd) -> Self {
+        Self {
+            stream: StdUnixStream::from(fd),
+        }
+    }
+
+    /// Gives the workspace back and waits until the server has it. Dropping the lease gives
+    /// it back too, but without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the connection breaks off first; the server takes the workspace back then
+    /// anyway.
+    pub fn give_back(mut self) -> io::Result<()> {
+        self.stream.write_all(LEASE_RETURN)?;
+        let mut answer = vec![0; LEASE_RETURNED.len()];
+        self.stream.read_exact(&mut answer)?;
+        if answer != LEASE_RETURNED {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected answer {:?}", String::from_utf8_lossy(&answer)),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AsFd for Lease {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+impl From<Lease> for OwnedFd {
+    fn from(lease: Lease) -> Self {
+        lease.stream.into()
+    }
 }
 
 /// Percent-encodes `text`, keeping `/` when `keep_slash` says so.
@@ -162,18 +231,7 @@ impl Client {
         if StatusCode::from_u16(response.status).is_ok_and(|status| status.is_success()) {
             return Ok(response.body);
         }
-        let error: ErrorBody = serde_json::from_slice(&response.body).map_err(|_| {
-            ClientError::Decode(format!(
-                "status {} with body {:?}",
-                response.status,
-                String::from_utf8_lossy(&response.body)
-            ))
-        })?;
-        Err(ClientError::Api {
-            status: response.status,
-            code: error.code,
-            error: error.error,
-        })
+        Err(api_error(&response))
     }
 
     async fn json<T: DeserializeOwned>(
@@ -635,30 +693,77 @@ impl Client {
         self.json(Method::POST, &path, Some(&request)).await
     }
 
-    /// Mounts a workspace at `path` on the server's host through `frontend`: an absolute,
-    /// empty directory, or for vhost-user the socket to create, which the guest mounts by
-    /// `tag` (the workspace's name if `None`).
+    /// Mounts a workspace at `path` on the server's host, an absolute, empty directory,
+    /// through `frontend`.
     ///
     /// # Errors
     ///
     /// Fails with `conflict` if the workspace is mounted already, `invalid` for a path that
-    /// is not an empty directory, a socket that exists or a bad tag, or `internal` if the
-    /// kernel refuses the mount.
+    /// is not an empty directory, or `internal` if the kernel refuses the mount.
     pub async fn mount(
         &self,
         workspace: &str,
         path: &str,
         frontend: Frontend,
-        tag: Option<&str>,
     ) -> Result<MountInfo, ClientError> {
         let route = format!("/v1/workspaces/{}/mount", segment(workspace));
         let request = MountInfo {
             workspace: String::new(),
             path: path.to_owned(),
             frontend,
-            tag: tag.map(str::to_owned),
         };
         self.json(Method::POST, &route, Some(&request)).await
+    }
+
+    /// Borrows a workspace from the server, which refuses every other request on it, and
+    /// garbage collection, until the lease is given back or dropped. A process serving the
+    /// workspace on its own, such as to a virtual machine, holds one meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `not_found` if there is no such workspace, or `conflict` if it is mounted
+    /// or lent already.
+    pub async fn lend(&self, workspace: &str) -> Result<Lease, ClientError> {
+        let stream =
+            UnixStream::connect(&self.socket)
+                .await
+                .map_err(|source| ClientError::Connect {
+                    socket: self.socket.clone(),
+                    source,
+                })?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(connection.with_upgrades());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/workspaces/{}/lend", segment(workspace)))
+            .header(HOST, "peerfs")
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, LEASE_PROTOCOL)
+            .body(Full::new(Bytes::new()))
+            .map_err(|e| ClientError::Decode(e.to_string()))?;
+        let response = sender.send_request(request).await?;
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            let status = response.status().as_u16();
+            let body = response.into_body().collect().await?.to_bytes();
+            return Err(api_error(&RawResponse { status, body }));
+        }
+        let upgraded = hyper::upgrade::on(response).await?;
+        let parts = upgraded.downcast::<TokioIo<UnixStream>>().map_err(|_| {
+            ClientError::Decode("an upgraded connection of another kind".to_owned())
+        })?;
+        if !parts.read_buf.is_empty() {
+            return Err(ClientError::Decode(
+                "the server spoke before the lease began".to_owned(),
+            ));
+        }
+        let stream = parts
+            .io
+            .into_inner()
+            .into_std()
+            .and_then(|stream| stream.set_nonblocking(false).map(|()| stream))
+            .map_err(|e| ClientError::Decode(e.to_string()))?;
+        Ok(Lease { stream })
     }
 
     /// Unmounts a workspace. Files still open there stop working.

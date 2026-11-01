@@ -17,7 +17,7 @@ use crate::object::{
 use crate::path::TreePath;
 use crate::refs::Refs;
 use crate::sign::{HostKeys, KeyFile, KnownHosts, PublicKey, Signer, sign_commit};
-use crate::store::{Store, sync_dir};
+use crate::store::{Access, Store, sync_dir};
 use crate::sync::{Pull, Pulled, Push, RawObject, Remote, Tracking, TrackingRefs, accept_objects};
 use crate::workspace::{Generation, Workspace};
 use std::cell::RefCell;
@@ -66,7 +66,8 @@ pub struct Space {
     generations: RefCell<HashMap<Name, Generation>>,
     /// Decoded trees, which never change, so lookups do not decode them again.
     trees: RefCell<HashMap<ObjectId, Arc<Tree>>>,
-    _lock: File,
+    /// The space's lock, unless this is a lent view of one workspace.
+    _lock: Option<File>,
 }
 
 /// Decoded trees kept before the cache starts over.
@@ -224,14 +225,40 @@ impl Space {
         };
         Ok(Self {
             dir: dir.to_owned(),
-            store: Store::open(&dir.join("objects"))?,
+            store: Store::open(&dir.join("objects"), Access::ReadWrite)?,
             refs: Refs::new(dir.join("refs/branches")),
             tracking: TrackingRefs::new(dir.join("refs/remotes")),
             signer,
             host_keys: Box::new(KnownHosts::new(dir.join(HOSTS_FILE))),
             generations: RefCell::new(HashMap::new()),
             trees: RefCell::new(HashMap::new()),
-            _lock: lock,
+            _lock: Some(lock),
+        })
+    }
+
+    /// Opens a view of the space in `dir` for serving one workspace that its owner has lent
+    /// out, as the space's server does to a process serving a virtual machine.
+    ///
+    /// The view takes no lock, cannot sign, and cannot store objects. It needs only the
+    /// space's `objects` directory, the lent workspace's directory under `workspaces`, and
+    /// the `classes` file if there is one. The caller must hold a lease on the workspace,
+    /// so that nothing else uses it meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the objects cannot be read.
+    pub fn open_lent(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        Ok(Self {
+            dir: dir.to_owned(),
+            store: Store::open(&dir.join("objects"), Access::ReadOnly)?,
+            refs: Refs::new(dir.join("refs/branches")),
+            tracking: TrackingRefs::new(dir.join("refs/remotes")),
+            signer: None,
+            host_keys: Box::new(KnownHosts::new(dir.join(HOSTS_FILE))),
+            generations: RefCell::new(HashMap::new()),
+            trees: RefCell::new(HashMap::new()),
+            _lock: None,
         })
     }
 

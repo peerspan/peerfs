@@ -169,10 +169,6 @@ pub struct MountInfo {
     /// How it is mounted; FUSE when not given.
     #[serde(default)]
     pub frontend: Frontend,
-    /// For `vhost-user`, the virtio-fs tag the guest mounts it by; the workspace's name
-    /// when not given.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
 }
 
 /// How a workspace is mounted.
@@ -184,11 +180,19 @@ pub enum Frontend {
     Fuse,
     /// An NFS version 3 server on the loopback interface, mounted by the kernel's client.
     Nfs,
-    /// A vhost-user-fs device for virtual machines: `path` is the Unix socket a VMM connects
-    /// to, as it would to `virtiofsd`.
-    #[serde(rename = "vhost-user")]
-    VhostUser,
 }
+
+/// The protocol `POST /v1/workspaces/{name}/lend` upgrades its connection to. The server
+/// lends the workspace to the client while the connection stays open: it refuses every
+/// other request on the workspace, and garbage collection, until the client sends
+/// [`LEASE_RETURN`] and reads [`LEASE_RETURNED`], or the connection closes.
+pub const LEASE_PROTOCOL: &str = "peerfs-lease";
+
+/// What a client sends to give a lent workspace back.
+pub const LEASE_RETURN: &[u8] = b"return\n";
+
+/// What the server answers once the workspace is back.
+pub const LEASE_RETURNED: &[u8] = b"returned\n";
 
 /// `POST /v1/workspaces`: create a workspace following a branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

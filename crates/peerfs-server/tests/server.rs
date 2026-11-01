@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use peerfs_api::{
-    Caller, ChangeInfo, Client, CommitResponse, EntryKind, MergeResponse, Method, Revision,
-    SnapshotResponse,
+    Caller, ChangeInfo, Client, CommitResponse, EntryKind, GcRequest, MergeResponse, Method,
+    Revision, SnapshotResponse,
 };
 use peerfs_core::{Author, Space};
 use peerfs_server::{Options, serve, socket_path};
@@ -622,4 +622,66 @@ async fn snapshots_over_the_api_are_replaced_by_one_signed_commit() {
         .await
         .unwrap();
     assert_eq!(unknown_field.status, 400);
+}
+
+#[tokio::test]
+async fn a_lent_workspace_is_left_alone_until_it_is_given_back() {
+    let running = start(None).await;
+    let client = &running.client;
+    client.create_workspace("w", "main").await.unwrap();
+    client.create_workspace("other", "main").await.unwrap();
+    client.write("w", "a.txt", "before\n").await.unwrap();
+
+    let lease = client.lend("w").await.unwrap();
+    let code = |result: Result<_, peerfs_api::ClientError>| {
+        result.err().and_then(|e| e.code().map(str::to_owned))
+    };
+    assert_eq!(
+        code(client.changes("w").await.map(drop)).as_deref(),
+        Some("conflict")
+    );
+    assert_eq!(
+        code(client.write("w", "b.txt", "x").await.map(drop)).as_deref(),
+        Some("conflict")
+    );
+    assert_eq!(code(client.discard("w").await).as_deref(), Some("conflict"));
+    assert_eq!(
+        code(client.lend("w").await.map(drop)).as_deref(),
+        Some("conflict")
+    );
+    assert_eq!(
+        code(client.gc(&GcRequest { dry_run: true }).await.map(drop)).as_deref(),
+        Some("conflict")
+    );
+    // The rest of the space carries on.
+    assert_eq!(client.workspaces().await.unwrap().len(), 2);
+    client.write("other", "c.txt", "x").await.unwrap();
+
+    // Giving it back waits until the server has it.
+    tokio::task::spawn_blocking(move || lease.give_back())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(client.changes("w").await.unwrap().len(), 1);
+
+    // A borrower that goes away without a word gives it back too.
+    drop(client.lend("w").await.unwrap());
+    let mut back = false;
+    for _ in 0..200 {
+        if client.changes("w").await.is_ok() {
+            back = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        back,
+        "the workspace came back once its lease's connection closed"
+    );
+    client.gc(&GcRequest { dry_run: true }).await.unwrap();
+
+    assert_eq!(
+        code(client.lend("missing").await.map(drop)).as_deref(),
+        Some("not_found")
+    );
 }

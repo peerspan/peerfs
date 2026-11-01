@@ -7,24 +7,20 @@
 //! which the same [`WorkspaceFs`] the FUSE mount uses answers. So the guest sees the
 //! workspace as the host's mounts do, and per-call snapshots and commits work as there.
 //!
-//! - One VM at a time: when it disconnects, the next can connect; stopping is refused while
-//!   one is connected.
+//! - One VM: [`serve_vm`] returns when it disconnects.
 //! - Every file shows as owned by the guest's root, who runs the guest's commands; a
 //!   workspace has no owners of its own.
 //! - The tag is set by the VMM, or read from the device's configuration by those that ask.
 
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 
 use fuse_backend_rs::api::server::Server;
 use fuse_backend_rs::transport::{Reader, VirtioFsWriter};
-use vhost::vhost_user::Listener;
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+use vhost::vhost_user::{Error as VhostUserError, Listener};
 use vhost_user_backend::{VhostUserBackend, VhostUserDaemon, VringMutex, VringT};
 use virtio_bindings::bindings::virtio_config::VIRTIO_F_VERSION_1;
 use virtio_bindings::bindings::virtio_ring::{
@@ -187,106 +183,46 @@ impl VhostUserBackend for FsDevice {
     }
 }
 
-/// A workspace served at a vhost-user socket by a thread of this process, one VM at a time.
-#[derive(Debug)]
-pub(crate) struct VhostUserMount {
-    socket: PathBuf,
-    /// The listening socket, shared with the serving thread, to wake it when stopping.
-    listener: UnixListener,
-    stopping: Arc<AtomicBool>,
-    connected: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl VhostUserMount {
-    /// Listens at `socket`, which must not exist, for VMMs to serve `fs` to, as `tag`.
-    pub(crate) fn new(fs: WorkspaceFs, socket: &Path, tag: &str) -> io::Result<Self> {
-        if socket.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{} exists", socket.display()),
-            ));
-        }
-        if tag.is_empty() || tag.len() > TAG_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("a virtio-fs tag is 1 to {TAG_LEN} bytes"),
-            ));
-        }
-        let fs = Arc::new(fs);
-        let stopping = Arc::new(AtomicBool::new(false));
-        let connected = Arc::new(AtomicBool::new(false));
-        // Bound here, so the socket exists once this returns.
-        let listener = UnixListener::bind(socket)?;
-        let ours = listener.try_clone()?;
-        let thread = {
-            let tag = tag.to_owned();
-            let (stopping, connected) = (Arc::clone(&stopping), Arc::clone(&connected));
-            thread::Builder::new()
-                .name("peerfs-vhost".to_owned())
-                .spawn(move || serve(&fs, &tag, listener, &stopping, &connected))?
-        };
-        Ok(Self {
-            socket: socket.to_owned(),
-            listener: ours,
-            stopping,
-            connected,
-            thread: Some(thread),
-        })
+/// Serves `fs` as a vhost-user-fs device named `tag` to the VMM that connects to
+/// `listener`, and returns once it disconnects. Every file shows as owned by the guest's
+/// root.
+///
+/// Threads start only once the VMM is accepted, so a caller may confine the process between
+/// binding `listener` and calling this.
+///
+/// # Errors
+///
+/// Fails if the tag is not 1 to 36 bytes, or if the vhost-user exchange fails other than
+/// by the VMM disconnecting.
+pub fn serve_vm(fs: WorkspaceFs, listener: UnixListener, tag: &str) -> io::Result<()> {
+    if tag.is_empty() || tag.len() > TAG_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("a virtio-fs tag is 1 to {TAG_LEN} bytes"),
+        ));
     }
-
-    /// Stops listening and removes the socket.
-    ///
-    /// Fails with [`io::ErrorKind::ResourceBusy`] while a VM is connected.
-    pub(crate) fn stop(&mut self) -> io::Result<()> {
-        let Some(thread) = self.thread.take() else {
-            return Ok(());
-        };
-        if self.connected.load(Ordering::SeqCst) {
-            self.thread = Some(thread);
-            return Err(io::Error::new(
-                io::ErrorKind::ResourceBusy,
-                "a virtual machine is connected",
-            ));
-        }
-        self.stopping.store(true, Ordering::SeqCst);
-        // Wake the thread waiting for a VMM, even if the socket's file is gone: shutting
-        // the listening socket down fails its accept.
-        // SAFETY: shutdown(2) on a socket this value owns; it has no other preconditions.
-        unsafe { libc::shutdown(self.listener.as_raw_fd(), libc::SHUT_RDWR) };
-        let _ = thread.join();
-        let _ = std::fs::remove_file(&self.socket);
+    let device = Arc::new(FsDevice::new(Arc::new(fs.owned_by(0, 0)), tag));
+    let memory = GuestMemoryAtomic::new(GuestMemoryMmap::new());
+    let mut daemon = VhostUserDaemon::new("peerfs-vhost".to_owned(), device, memory)
+        .map_err(|e| daemon_error(&e))?;
+    daemon
+        .start(&mut Listener::from(listener))
+        .map_err(|e| daemon_error(&e))?;
+    // Returns when the VMM disconnects.
+    let served = daemon.wait();
+    for handler in daemon.get_epoll_handlers() {
+        handler.send_exit_event();
+    }
+    match served {
+        // How a VMM ends the exchange, cleanly or with its guest gone.
         Ok(())
+        | Err(vhost_user_backend::Error::HandleRequest(
+            VhostUserError::Disconnected | VhostUserError::PartialMessage,
+        )) => Ok(()),
+        Err(e) => Err(daemon_error(&e)),
     }
 }
 
-/// Serves one VMM after another until told to stop.
-fn serve(
-    fs: &Arc<WorkspaceFs>,
-    tag: &str,
-    listener: UnixListener,
-    stopping: &AtomicBool,
-    connected: &AtomicBool,
-) {
-    let mut listener = Listener::from(listener);
-    loop {
-        let device = Arc::new(FsDevice::new(Arc::clone(fs), tag));
-        let memory = GuestMemoryAtomic::new(GuestMemoryMmap::new());
-        let Ok(mut daemon) = VhostUserDaemon::new("peerfs-vhost".to_owned(), device, memory) else {
-            return;
-        };
-        if daemon.start(&mut listener).is_err() || stopping.load(Ordering::SeqCst) {
-            return;
-        }
-        connected.store(true, Ordering::SeqCst);
-        // Returns when the VMM disconnects.
-        let _ = daemon.wait();
-        for handler in daemon.get_epoll_handlers() {
-            handler.send_exit_event();
-        }
-        connected.store(false, Ordering::SeqCst);
-        if stopping.load(Ordering::SeqCst) {
-            return;
-        }
-    }
+fn daemon_error(error: &vhost_user_backend::Error) -> io::Error {
+    io::Error::other(error.to_string())
 }

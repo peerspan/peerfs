@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 peerfs-api.workspace = true
 peerfs-core.workspace = true
 peerfs-mount.workspace = true

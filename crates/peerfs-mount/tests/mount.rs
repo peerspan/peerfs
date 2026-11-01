@@ -24,7 +24,7 @@ fn author() -> Author {
 
 /// Whether this machine lets the test mount through `frontend`, which must be one the
 /// host's kernel mounts.
-fn available(frontend: &Frontend) -> bool {
+fn available(frontend: Frontend) -> bool {
     match frontend {
         Frontend::Fuse => fs::OpenOptions::new()
             .read(true)
@@ -39,7 +39,6 @@ fn available(frontend: &Frontend) -> bool {
                 .iter()
                 .any(|helper| Path::new(helper).exists())
         }
-        Frontend::VhostUser { .. } => false,
     }
 }
 
@@ -74,7 +73,7 @@ struct Fixture {
 /// A space whose `main` holds `src/lib.rs`, `run.sh` (executable) and `docs/a.md`, with
 /// workspace `w` mounted through `frontend`.
 fn fixture(frontend: Frontend) -> Option<Fixture> {
-    if !available(&frontend) {
+    if !available(frontend) {
         // This machine cannot mount this way; there is nothing to test.
         return None;
     }

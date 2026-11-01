@@ -9,15 +9,16 @@
 mod client;
 mod wire;
 
-pub use client::{Client, ClientError, RawResponse};
+pub use client::{Client, ClientError, Lease, RawResponse};
 pub use hyper::Method;
 pub use wire::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
     ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody, ExportRequest,
     FetchRequest, ForkRequest, Frontend, GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey,
-    ImportRequest, MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest,
-    PushResponse, ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SnapshotRequest,
-    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    ImportRequest, LEASE_PROTOCOL, LEASE_RETURN, LEASE_RETURNED, MergeRequest, MergeResponse,
+    MountInfo, PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse,
+    RestoreRequest, RestoreResponse, Revision, SnapshotRequest, SnapshotResponse, SpaceInfo,
+    TrackingInfo, WorkspaceInfo,
 };
 
 /// The socket's file name inside the space directory.

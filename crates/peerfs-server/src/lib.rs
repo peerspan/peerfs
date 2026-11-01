@@ -4,7 +4,7 @@
 //! here instead of contending for the space's lock. The routes and bodies are those of
 //! [`peerfs_api`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -14,21 +14,23 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::{CONNECTION, UPGRADE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use hyper_util::rt::TokioIo;
 use peerfs_api::{
     AdvanceRequest, BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest,
     CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
     ExportRequest, FetchRequest, ForkRequest, Frontend, GcRequest, GcResponse, HaveRequest,
-    HaveResponse, HostKey, ImportRequest, MergeRequest, MergeResponse, MountInfo, PullRequest,
-    PullResponse, PushRequest, PushResponse, ReceiveResponse, RestoreRequest, RestoreResponse,
-    Revision, SOCKET_NAME, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo,
-    WorkspaceInfo,
+    HaveResponse, HostKey, ImportRequest, LEASE_PROTOCOL, LEASE_RETURN, LEASE_RETURNED,
+    MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
+    ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SOCKET_NAME, SnapshotRequest,
+    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 use peerfs_core::{
     Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH, GcOptions,
@@ -36,6 +38,7 @@ use peerfs_core::{
 };
 use peerfs_mount::{Frontend as MountFrontend, Mount};
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
@@ -66,6 +69,9 @@ struct Shared {
     space: Arc<Mutex<Space>>,
     /// Mounted workspaces, by name.
     mounts: Mutex<BTreeMap<String, Mount>>,
+    /// Workspaces lent to other processes, which this server leaves alone meanwhile. Taken
+    /// after `mounts` when both are.
+    lent: Mutex<BTreeSet<String>>,
     host: String,
     started: Instant,
     last_request_ms: AtomicU64,
@@ -88,6 +94,7 @@ pub fn router(space: Space, host: String) -> Router {
     router_with(Arc::new(Shared {
         space: Arc::new(Mutex::new(space)),
         mounts: Mutex::new(BTreeMap::new()),
+        lent: Mutex::new(BTreeSet::new()),
         host,
         started: Instant::now(),
         last_request_ms: AtomicU64::new(0),
@@ -135,6 +142,11 @@ fn router_with(state: AppState) -> Router {
         )
         .route("/v1/mounts", get(mounts))
         .route("/v1/gc", post(gc))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            refuse_lent,
+        ))
+        .route("/v1/workspaces/{name}/lend", post(lend_workspace))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(JSON_LIMIT))
@@ -167,6 +179,7 @@ pub async fn serve(space: Space, options: Options) -> io::Result<()> {
     let state = Arc::new(Shared {
         space: Arc::new(Mutex::new(space)),
         mounts: Mutex::new(BTreeMap::new()),
+        lent: Mutex::new(BTreeSet::new()),
         host: options.host,
         started: Instant::now(),
         last_request_ms: AtomicU64::new(0),
@@ -194,8 +207,9 @@ async fn watch_idle(state: AppState, timeout: Duration, stop: Arc<Notify>) {
     loop {
         tokio::time::sleep(IDLE_CHECK.min(timeout)).await;
         let now = elapsed_ms(state.started);
-        if !lock_mounts(&state).is_empty() {
-            // A mount is served by this process, so it is in use however quiet the API is.
+        if !lock_mounts(&state).is_empty() || !lock_lent(&state).is_empty() {
+            // A mount is served by this process, or a workspace is lent, so it is in use
+            // however quiet the API is.
             state.last_request_ms.store(now, Ordering::Relaxed);
             continue;
         }
@@ -800,7 +814,15 @@ async fn gc(
     body: Result<Json<GcRequest>, JsonRejection>,
 ) -> ApiResult<Json<GcResponse>> {
     let Json(request) = body?;
+    let shared = Arc::clone(&state);
     with_space(&state, move |space, _| {
+        // Checked under the space's lock, which a lease is granted under too: compacting
+        // packs would pull objects from under a borrower's index.
+        if let Some(name) = lock_lent(&shared).first() {
+            return Err(ApiError::conflict(format!(
+                "workspace {name} is lent to another process; collect garbage once it is back"
+            )));
+        }
         let options = GcOptions {
             dry_run: request.dry_run,
             ..GcOptions::default()
@@ -971,6 +993,102 @@ async fn add_host(
     .await
 }
 
+fn lock_lent(state: &Shared) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+    state
+        .lent
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Refuses requests on a lent workspace, so that only its borrower changes it.
+async fn refuse_lent(
+    State(state): State<AppState>,
+    params: Result<UrlPath<HashMap<String, String>>, PathRejection>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path().starts_with("/v1/workspaces/")
+        && let Ok(UrlPath(params)) = params
+        && let Some(name) = params.get("name")
+        && lock_lent(&state).contains(name)
+    {
+        return ApiError::conflict(format!("workspace {name} is lent to another process"))
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// A workspace lent out, until this is dropped.
+struct Lent {
+    state: AppState,
+    name: String,
+}
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        lock_lent(&self.state).remove(&self.name);
+    }
+}
+
+async fn lend_workspace(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    mut request: Request,
+) -> ApiResult<Response> {
+    let upgrading = request.headers().get(UPGRADE).is_some_and(|protocol| {
+        protocol
+            .as_bytes()
+            .eq_ignore_ascii_case(LEASE_PROTOCOL.as_bytes())
+    });
+    if !upgrading {
+        return Err(ApiError::invalid(format!(
+            "lending takes a connection upgraded to {LEASE_PROTOCOL}"
+        )));
+    }
+    {
+        let mounts = lock_mounts(&state);
+        if let Some(mounted) = mounts.get(&name) {
+            return Err(ApiError::conflict(format!(
+                "workspace {name} is mounted at {}",
+                mounted.path().display()
+            )));
+        }
+        if !lock_lent(&state).insert(name.clone()) {
+            return Err(ApiError::conflict(format!(
+                "workspace {name} is lent to another process already"
+            )));
+        }
+    }
+    let lent = Lent {
+        state: Arc::clone(&state),
+        name: name.clone(),
+    };
+    // Under the space's lock, after the workspace is marked lent, so that no garbage
+    // collection is running once the borrower opens the store.
+    with_space(&state, move |space, _| {
+        Ok(space.workspace(&name).map(drop)?)
+    })
+    .await?;
+    let upgrade = hyper::upgrade::on(&mut request);
+    tokio::spawn(async move {
+        // The workspace comes back when the borrower says so or its connection closes.
+        let Ok(upgraded) = upgrade.await else { return };
+        let mut connection = TokioIo::new(upgraded);
+        let mut message = vec![0; LEASE_RETURN.len()];
+        let returned = connection.read_exact(&mut message).await.is_ok() && message == LEASE_RETURN;
+        drop(lent);
+        if returned {
+            let _ = connection.write_all(LEASE_RETURNED).await;
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(CONNECTION, "upgrade")
+        .header(UPGRADE, LEASE_PROTOCOL)
+        .body(Body::empty())
+        .map_err(|e| ApiError::internal(&e))
+}
+
 fn lock_mounts(state: &Shared) -> std::sync::MutexGuard<'_, BTreeMap<String, Mount>> {
     state
         .mounts
@@ -1015,19 +1133,20 @@ async fn mount_workspace(
                 mounted.path().display()
             )));
         }
+        if lock_lent(&shared).contains(&name) {
+            return Err(ApiError::conflict(format!(
+                "workspace {name} is lent to another process"
+            )));
+        }
         let frontend = match request.frontend {
             Frontend::Fuse => MountFrontend::Fuse,
             Frontend::Nfs => MountFrontend::Nfs,
-            Frontend::VhostUser => MountFrontend::VhostUser {
-                tag: request.tag.clone().unwrap_or_else(|| name.clone()),
-            },
         };
         let mount = Mount::new(Arc::clone(&shared.space), &name, &path, frontend).map_err(|e| {
             match e.kind() {
                 io::ErrorKind::NotFound
                 | io::ErrorKind::DirectoryNotEmpty
                 | io::ErrorKind::NotADirectory
-                | io::ErrorKind::AlreadyExists
                 | io::ErrorKind::InvalidInput => {
                     ApiError::invalid(format!("{}: {e}", path.display()))
                 }
@@ -1086,14 +1205,9 @@ fn mount_info(workspace: &str, mount: &Mount) -> MountInfo {
     MountInfo {
         workspace: workspace.to_owned(),
         path: mount.path().display().to_string(),
-        tag: match mount.frontend() {
-            MountFrontend::VhostUser { tag } => Some(tag),
-            _ => None,
-        },
         frontend: match mount.frontend() {
             MountFrontend::Fuse => Frontend::Fuse,
             MountFrontend::Nfs => Frontend::Nfs,
-            MountFrontend::VhostUser { .. } => Frontend::VhostUser,
         },
     }
 }

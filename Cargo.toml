@@ -40,6 +40,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 ignore = "0.4"
 libc = "0.2"
+rustix = { version = "1.1", features = ["event", "fs", "mount", "process", "thread"] }
+seccompiler = "0.5"
 # The rust-vmm releases fuse-backend-rs 0.14 builds on, so the types line up.
 vhost = { version = "0.15", features = ["vhost-user-backend"] }
 vhost-user-backend = "0.21"
@@ -51,7 +53,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 zstd = "0.14"
 
 # From BeautifulRust's lints/lints.toml.

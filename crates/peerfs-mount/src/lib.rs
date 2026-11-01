@@ -1,10 +1,10 @@
 //! A peerfs workspace as a file system, served over FUSE, loopback NFS or vhost-user-fs.
 //!
-//! [`WorkspaceFs`] implements fuse-backend-rs's `FileSystem` on top of a [`Workspace`], so
-//! the same code serves `/dev/fuse` on Linux and, later, vhost-user-fs for VMs. The NFS
-//! server, for macOS, and the vhost-user-fs device, for virtual machines, answer with the
-//! same code; see [`Frontend`]. Every operation
-//! takes the space's lock, so the mount and the local API see one workspace.
+//! [`WorkspaceFs`] implements fuse-backend-rs's `FileSystem` on top of a [`Workspace`]. It
+//! serves `/dev/fuse` on Linux, and the NFS server, for macOS, answers with the same code;
+//! see [`Frontend`]. [`serve_vm`] serves it to a virtual machine as a vhost-user-fs device.
+//! Every operation takes the space's lock, so the mount and the local API see one
+//! workspace.
 //!
 //! - Reads come from the overlay's real file, or from the store for a file only in the
 //!   base. Recently read base files are kept decoded.
@@ -52,6 +52,8 @@ use peerfs_core::{
 
 mod nfs;
 mod vhost;
+
+pub use vhost::serve_vm;
 
 /// How long the kernel may cache names and attributes. Short, because the local API can
 /// change the workspace underneath the mount.
@@ -882,7 +884,7 @@ impl FileSystem for WorkspaceFs {
 }
 
 /// How a workspace is mounted.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Frontend {
     /// FUSE, on Linux.
     #[default]
@@ -890,13 +892,6 @@ pub enum Frontend {
     /// An NFS version 3 server on the loopback interface, mounted by the kernel's client: for
     /// macOS, and testable on Linux. Mounting needs the privileges `mount` needs.
     Nfs,
-    /// A vhost-user-fs device for virtual machines, served at a Unix socket that a VMM
-    /// connects to, as it would to `virtiofsd`. The guest mounts it as virtio-fs by `tag`,
-    /// and sees every file as its root's.
-    VhostUser {
-        /// The tag, 1 to 36 bytes.
-        tag: String,
-    },
 }
 
 /// A workspace mounted at a directory, served by threads of this process. Dropping it
@@ -912,27 +907,22 @@ enum Served {
         threads: Vec<JoinHandle<()>>,
     },
     Nfs(nfs::NfsMount),
-    VhostUser {
-        mount: vhost::VhostUserMount,
-        tag: String,
-    },
 }
 
 impl Mount {
-    /// Mounts `workspace` of `space` at `path` through `frontend`: for FUSE and NFS an
-    /// existing empty directory, for vhost-user the socket to create.
+    /// Mounts `workspace` of `space` at `path`, an existing empty directory, through
+    /// `frontend`.
     ///
     /// # Errors
     ///
-    /// Fails if `path` is not an empty directory, or for vhost-user exists already or the tag
-    /// is not 1 to 36 bytes, or if the kernel refuses the mount.
+    /// Fails if `path` is not an empty directory, or if the kernel refuses the mount.
     pub fn new(
         space: Arc<Mutex<Space>>,
         workspace: &str,
         path: &Path,
         frontend: Frontend,
     ) -> io::Result<Self> {
-        if !matches!(frontend, Frontend::VhostUser { .. }) && fs::read_dir(path)?.next().is_some() {
+        if fs::read_dir(path)?.next().is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::DirectoryNotEmpty,
                 format!("{} is not empty", path.display()),
@@ -942,10 +932,6 @@ impl Mount {
         let served = match frontend {
             Frontend::Fuse => mount_fuse(fs, workspace, path)?,
             Frontend::Nfs => Served::Nfs(nfs::NfsMount::new(fs, workspace, path)?),
-            Frontend::VhostUser { tag } => Served::VhostUser {
-                mount: vhost::VhostUserMount::new(fs.owned_by(0, 0), path, &tag)?,
-                tag,
-            },
         };
         Ok(Self {
             path: path.to_owned(),
@@ -953,7 +939,7 @@ impl Mount {
         })
     }
 
-    /// Where the workspace is mounted: a directory, or for vhost-user the socket.
+    /// Where the workspace is mounted.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -963,7 +949,6 @@ impl Mount {
         match &self.served {
             Served::Fuse { .. } => Frontend::Fuse,
             Served::Nfs(_) => Frontend::Nfs,
-            Served::VhostUser { tag, .. } => Frontend::VhostUser { tag: tag.clone() },
         }
     }
 
@@ -972,8 +957,7 @@ impl Mount {
     ///
     /// # Errors
     ///
-    /// Fails if the kernel refuses to unmount, as when a process has a file open there, or
-    /// for vhost-user while a virtual machine is connected.
+    /// Fails if the kernel refuses to unmount, as when a process has a file open there.
     pub fn unmount(&mut self) -> io::Result<()> {
         self.stop()
     }
@@ -995,7 +979,6 @@ impl Mount {
                 Ok(())
             }
             Served::Nfs(mount) => mount.stop(&self.path),
-            Served::VhostUser { mount, .. } => mount.stop(),
         }
     }
 }
