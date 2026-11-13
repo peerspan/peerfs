@@ -950,6 +950,9 @@ dependencies = [
  "fastcdc",
  "getrandom 0.4.3",
  "ignore",
+ "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "zstd",
@@ -979,12 +982,14 @@ name = "peerfs-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "hyper",
  "hyper-util",
  "peerfs-api",
  "peerfs-core",
  "peerfs-mount",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

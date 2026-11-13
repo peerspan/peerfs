@@ -27,6 +27,7 @@ mod classes;
 mod codec;
 mod edit;
 mod error;
+mod host;
 mod id;
 mod merge;
 mod object;
@@ -41,6 +42,7 @@ mod workspace;
 pub use classes::{Class, DEFAULT_DERIVED, DEFAULT_SECRET, OwnerRules};
 pub use codec::DecodeError;
 pub use error::{Error, Result};
+pub use host::{BINDING_FILE, HostBinding, INIT_RECEIPT_FILE, MAX_SIGNING_MESSAGE, host_id_of};
 pub use id::{Algorithm, DIGEST_LEN, ENCODED_LEN, ObjectId, ParseIdError};
 pub use merge::{Conflict, ConflictKind};
 pub use object::{

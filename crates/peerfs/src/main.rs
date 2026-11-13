@@ -22,7 +22,8 @@ use peerfs_api::{
     Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitResponse, EntryKind, Frontend,
     GcRequest, GcResponse, MergeResponse, Revision, SnapshotResponse,
 };
-use peerfs_core::{Author, Space};
+use peerfs_core::{Author, HostBinding, Space};
+use peerfs_server::host_bridge::{BindingHostKeys, HostClient, HostSigner};
 use peerfs_server::{Options, serve, socket_path};
 
 /// The file in a space naming the host its server records on commits.
@@ -57,8 +58,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a space with an empty `main` branch.
-    Init,
+    /// Create a space with an empty `main` branch. With `--host-socket` and `--space-id`,
+    /// create a host-backed space, whose commits the Peerspan host signs: the host must
+    /// have prepared that space for this directory, which must be empty and private.
+    Init {
+        /// The Peerspan host's owner-local socket, which signs for a host-backed space.
+        #[arg(long, requires = "space_id")]
+        host_socket: Option<PathBuf>,
+        /// The space the host prepared, `space_` and 32 hex digits.
+        #[arg(long, requires = "host_socket")]
+        space_id: Option<String>,
+    },
     /// Serve the space on its socket until stopped.
     Serve {
         /// Exit after this many seconds without a request.
@@ -248,6 +258,109 @@ struct MountArgs {
     nfs: bool,
 }
 
+/// Creates a host-backed space in `space_dir`, prepared by the host at `host_socket` as
+/// `space_id`, whose first commit the host signs.
+async fn init_host_backed(
+    space_dir: &Path,
+    host_socket: &Path,
+    space_id: String,
+    agent: Option<String>,
+    session: Option<String>,
+) -> Result<()> {
+    let host_socket = std::path::absolute(host_socket)
+        .with_context(|| format!("resolving {}", host_socket.display()))?;
+    let dir = space_dir.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let view = HostClient::new(&host_socket)
+            .binding(&space_id)
+            .context("asking the host for the space's binding")?;
+        if Path::new(&view.directory) != dir {
+            bail!(
+                "the host prepared space {space_id} for {}, not {}",
+                view.directory,
+                dir.display()
+            );
+        }
+        if view.state == "released" {
+            bail!("the host has released space {space_id}");
+        }
+        let binding = HostBinding {
+            space_id: view.space_id,
+            binding_id: view.binding_id,
+            network_id: view.network_id,
+            context_id: view.context_id,
+            host_id: view.host_id,
+            public_key: view
+                .public_key
+                .parse()
+                .context("the host's public key is malformed")?,
+            host_socket,
+        };
+        Space::init_host(
+            &dir,
+            &binding,
+            Box::new(HostSigner::new(binding.clone())),
+            Box::new(BindingHostKeys::new(&binding)),
+            agent,
+            session,
+        )
+        .with_context(|| format!("creating a host-backed space in {}", dir.display()))?;
+        Ok(())
+    })
+    .await
+    .context("initializing")?
+}
+
+/// Creates a space in `space_dir`: host-backed when `host` names the host's socket and the
+/// space it prepared, otherwise one that signs with its own key file and records `author`'s
+/// host in its `HOST` file.
+async fn init(space_dir: &Path, host: Option<(PathBuf, String)>, author: Author) -> Result<()> {
+    if let Some((host_socket, space_id)) = host {
+        return init_host_backed(
+            space_dir,
+            &host_socket,
+            space_id,
+            author.agent,
+            author.session,
+        )
+        .await;
+    }
+    Space::init(space_dir, &author)
+        .with_context(|| format!("creating a space in {}", space_dir.display()))?;
+    let host_file = space_dir.join(HOST_FILE);
+    fs::write(&host_file, format!("{}\n", author.host))
+        .with_context(|| format!("writing {}", host_file.display()))
+}
+
+/// Whether the space in `dir` is host-backed: its commits signed through its host.
+fn is_host_backed(dir: &Path) -> bool {
+    fs::read_to_string(dir.join("FORMAT"))
+        .is_ok_and(|format| format.lines().next() == Some("peerfs space 3"))
+}
+
+/// Opens the space in `dir` for its server: through its host when it is host-backed.
+async fn open_for_serving(dir: &Path) -> Result<peerfs_core::Result<Space>> {
+    if !is_host_backed(dir) {
+        return Ok(Space::open(dir));
+    }
+    let dir = dir.to_owned();
+    tokio::task::spawn_blocking(move || open_host_backed(&dir))
+        .await
+        .context("opening")
+}
+
+/// Opens the host-backed space in `dir`, after checking that its host still holds the
+/// binding it was created under.
+fn open_host_backed(dir: &Path) -> peerfs_core::Result<Space> {
+    let binding = HostBinding::load(dir)?;
+    HostClient::new(&binding.host_socket).check(&binding, dir)?;
+    Space::open_host(
+        dir,
+        Box::new(HostSigner::new(binding.clone())),
+        Box::new(BindingHostKeys::new(&binding)),
+    )
+}
+
 fn hostname() -> String {
     fs::read_to_string("/etc/hostname")
         .ok()
@@ -293,23 +406,32 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .filter(|host| !host.is_empty())
         })
         .unwrap_or_else(hostname);
+    let creating_host_backed = matches!(
+        cli.command,
+        Command::Init {
+            host_socket: Some(_),
+            ..
+        }
+    );
+    if cli.host.is_some() && (creating_host_backed || is_host_backed(&space_dir)) {
+        bail!("a host-backed space's commits are authored by its host; --host does not apply");
+    }
     match cli.command {
-        Command::Init => {
+        Command::Init {
+            host_socket,
+            space_id,
+        } => {
             let author = Author {
                 host,
                 agent: cli.agent,
                 session: cli.session,
             };
-            Space::init(&space_dir, &author)
-                .with_context(|| format!("creating a space in {}", space_dir.display()))?;
-            let host_file = space_dir.join(HOST_FILE);
-            fs::write(&host_file, format!("{}\n", author.host))
-                .with_context(|| format!("writing {}", host_file.display()))?;
+            init(&space_dir, host_socket.zip(space_id), author).await?;
             writeln!(io::stdout().lock(), "created {}", space_dir.display())?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Serve { idle_timeout } => {
-            let space = match Space::open(&space_dir) {
+            let space = match open_for_serving(&space_dir).await? {
                 Ok(space) => space,
                 Err(peerfs_core::Error::SpaceInUse { .. })
                     if Client::new(socket_path(&space_dir)).space().await.is_ok() =>
@@ -442,7 +564,7 @@ async fn client_command(
     out: &mut impl Write,
 ) -> Result<ExitCode> {
     match command {
-        Command::Init
+        Command::Init { .. }
         | Command::Serve { .. }
         | Command::Stop
         | Command::Hook(_)

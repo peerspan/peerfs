@@ -4,6 +4,8 @@
 //! here instead of contending for the space's lock. The routes and bodies are those of
 //! [`peerfs_api`].
 
+pub mod host_bridge;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -73,6 +75,9 @@ struct Shared {
     /// after `mounts` when both are.
     lent: Mutex<BTreeSet<String>>,
     host: String,
+    /// A host-backed space's provider identity, for `GET /v1/host-bridge`: fixed when the
+    /// server starts, so answering needs neither the space nor the host.
+    bridge: Option<serde_json::Value>,
     started: Instant,
     last_request_ms: AtomicU64,
 }
@@ -89,13 +94,35 @@ pub fn pid_path(space_dir: &Path) -> PathBuf {
     space_dir.join("serve.pid")
 }
 
+/// A host-backed space's provider identity, as `GET /v1/host-bridge` reports it.
+fn bridge_identity(space: &Space) -> Option<serde_json::Value> {
+    space.host_binding().map(|binding| {
+        serde_json::json!({
+            "format": 1,
+            "protocol": "peerfs-host-v1",
+            "space_id": binding.space_id,
+            "binding_id": binding.binding_id,
+            "network_id": binding.network_id,
+            "context_id": binding.context_id,
+            "host_id": binding.host_id,
+            "public_key": binding.public_key.to_string(),
+            "directory": space.path().display().to_string(),
+        })
+    })
+}
+
 /// The API's routes over `space`.
 pub fn router(space: Space, host: String) -> Router {
+    let host = space
+        .host_binding()
+        .map_or(host, |binding| binding.host_id.clone());
+    let bridge = bridge_identity(&space);
     router_with(Arc::new(Shared {
         space: Arc::new(Mutex::new(space)),
         mounts: Mutex::new(BTreeMap::new()),
         lent: Mutex::new(BTreeSet::new()),
         host,
+        bridge,
         started: Instant::now(),
         last_request_ms: AtomicU64::new(0),
     }))
@@ -108,6 +135,7 @@ fn router_with(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(FILE_LIMIT));
     Router::new()
         .route("/v1/space", get(space_info))
+        .route("/v1/host-bridge", get(host_bridge_info))
         .route("/v1/branches", get(branches).post(fork))
         .route("/v1/branches/{name}/log", get(log))
         .route("/v1/import", post(import))
@@ -176,11 +204,17 @@ pub async fn serve(space: Space, options: Options) -> io::Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     let pid_file = pid_path(space.path());
     std::fs::write(&pid_file, format!("{}\n", std::process::id()))?;
+    // A host-backed space's commits are authored by its host, whatever the options say.
+    let host = space
+        .host_binding()
+        .map_or(options.host, |binding| binding.host_id.clone());
+    let bridge = bridge_identity(&space);
     let state = Arc::new(Shared {
         space: Arc::new(Mutex::new(space)),
         mounts: Mutex::new(BTreeMap::new()),
         lent: Mutex::new(BTreeSet::new()),
-        host: options.host,
+        host,
+        bridge,
         started: Instant::now(),
         last_request_ms: AtomicU64::new(0),
     });
@@ -329,7 +363,9 @@ impl From<Error> for ApiError {
             | Error::BranchMoved { .. }
             | Error::NotFastForward { .. }
             | Error::WorkspaceNotClean(_)
-            | Error::BaseMoved(_) => (StatusCode::CONFLICT, "conflict"),
+            | Error::BaseMoved(_)
+            | Error::HostBacked(_) => (StatusCode::CONFLICT, "conflict"),
+            Error::Signing(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
             Error::InvalidName(_)
             | Error::InvalidPath(_)
             | Error::WrongEntry { .. }
@@ -459,6 +495,16 @@ async fn method_not_allowed() -> ApiError {
         code: "invalid",
         message: "method not allowed".to_owned(),
     }
+}
+
+/// A host-backed space's provider identity, which the host checks when it activates the
+/// space's binding. A space that signs with its own key file has none.
+async fn host_bridge_info(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    state.bridge.clone().map(Json).ok_or_else(|| {
+        ApiError::from(peerfs_core::Error::NotFound(
+            "this space is not host-backed".to_owned(),
+        ))
+    })
 }
 
 async fn space_info(State(state): State<AppState>) -> ApiResult<Json<SpaceInfo>> {
