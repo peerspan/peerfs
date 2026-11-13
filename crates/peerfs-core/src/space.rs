@@ -9,6 +9,7 @@ use crate::classes::OwnerRules;
 use crate::codec::len_u64;
 use crate::edit::TreeEdit;
 use crate::error::{Error, Result};
+use crate::host::{HostBinding, INIT_RECEIPT_FILE, InitReceipt};
 use crate::id::ObjectId;
 use crate::merge::{Conflict, merge_trees};
 use crate::object::{
@@ -30,6 +31,13 @@ pub use gc::{GcOptions, GcReport};
 
 /// The first line of a space's `FORMAT` file.
 const FORMAT: &str = "peerfs space 2";
+
+/// The first line of a host-backed space's `FORMAT` file: one whose commits its host signs.
+/// Older binaries refuse it, rather than open it without its host's signer.
+const HOST_FORMAT: &str = "peerfs space 3";
+
+/// The first commit's message.
+const FIRST_MESSAGE: &str = "Create the space";
 
 /// The space's signing key, until the host daemon signs for it.
 const KEY_FILE: &str = "signing.key";
@@ -62,6 +70,8 @@ pub struct Space {
     tracking: TrackingRefs,
     signer: Option<Box<dyn Signer>>,
     host_keys: Box<dyn HostKeys>,
+    /// The binding of a host-backed space, whose host signs its commits.
+    host: Option<HostBinding>,
     /// Each workspace's count of writes to its state and whiteouts, shared by its values.
     generations: RefCell<HashMap<Name, Generation>>,
     /// Decoded trees, which never change, so lookups do not decode them again.
@@ -138,6 +148,57 @@ fn lock_path(dir: &Path) -> PathBuf {
     dir.join("space.lock")
 }
 
+/// Checks that `dir`'s `FORMAT` file starts with `expected`.
+fn check_format(dir: &Path, expected: &str) -> Result<()> {
+    let format = dir.join("FORMAT");
+    let found = fs::read_to_string(&format).map_err(|e| Error::NotASpace {
+        path: dir.to_owned(),
+        reason: format!("cannot read FORMAT: {e}"),
+    })?;
+    match found.lines().next() {
+        Some(line) if line == expected => Ok(()),
+        Some(HOST_FORMAT) => Err(Error::NotASpace {
+            path: dir.to_owned(),
+            reason: "a host-backed space, which opens only with its host's signer".to_owned(),
+        }),
+        _ => Err(Error::NotASpace {
+            path: dir.to_owned(),
+            reason: format!("unknown format {:?}", found.trim()),
+        }),
+    }
+}
+
+/// Takes `dir`'s exclusive lock, creating its lock file.
+fn lock_space(dir: &Path) -> Result<File> {
+    let lock_path = lock_path(dir);
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| Error::io("opening", &lock_path, e))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => Err(Error::SpaceInUse {
+            path: dir.to_owned(),
+        }),
+        Err(fs::TryLockError::Error(e)) => Err(Error::io("locking", lock_path, e)),
+    }
+}
+
+/// Refuses a host-backed space holding a key file or a `hosts` file: it never signs or
+/// trusts keys any other way than through its host.
+fn refuse_key_files(dir: &Path) -> Result<()> {
+    for file in [KEY_FILE, HOSTS_FILE] {
+        if dir.join(file).exists() {
+            return Err(Error::HostBacked(format!(
+                "{file} is there, and a host-backed space must not hold one"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl Space {
     /// Creates a space in `dir`, which must not exist or be empty, with a `main` branch at
     /// an empty first commit, and a new signing key.
@@ -172,7 +233,7 @@ impl Space {
             change: ChangeId::random(),
             author: author.clone(),
             time: SystemTime::now(),
-            message: "Create the space".to_owned(),
+            message: FIRST_MESSAGE.to_owned(),
             predecessor: None,
             signature: None,
         })?;
@@ -190,50 +251,208 @@ impl Space {
     /// a file system error.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
-        let format = dir.join("FORMAT");
-        let found = fs::read_to_string(&format).map_err(|e| Error::NotASpace {
-            path: dir.to_owned(),
-            reason: format!("cannot read FORMAT: {e}"),
-        })?;
-        if found.lines().next() != Some(FORMAT) {
-            return Err(Error::NotASpace {
-                path: dir.to_owned(),
-                reason: format!("unknown format {:?}", found.trim()),
-            });
-        }
-        let lock_path = lock_path(dir);
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|e| Error::io("opening", &lock_path, e))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(Error::SpaceInUse {
-                    path: dir.to_owned(),
-                });
-            }
-            Err(fs::TryLockError::Error(e)) => return Err(Error::io("locking", lock_path, e)),
-        }
+        check_format(dir, FORMAT)?;
+        let lock = lock_space(dir)?;
         let key_path = dir.join(KEY_FILE);
         let signer: Option<Box<dyn Signer>> = if key_path.exists() {
             Some(Box::new(KeyFile::load(&key_path)?))
         } else {
             None
         };
+        let host_keys = Box::new(KnownHosts::new(dir.join(HOSTS_FILE)));
+        Self::open_locked(dir, lock, signer, host_keys, None)
+    }
+
+    fn open_locked(
+        dir: &Path,
+        lock: File,
+        signer: Option<Box<dyn Signer>>,
+        host_keys: Box<dyn HostKeys>,
+        host: Option<HostBinding>,
+    ) -> Result<Self> {
         Ok(Self {
             dir: dir.to_owned(),
             store: Store::open(&dir.join("objects"), Access::ReadWrite)?,
             refs: Refs::new(dir.join("refs/branches")),
             tracking: TrackingRefs::new(dir.join("refs/remotes")),
             signer,
-            host_keys: Box::new(KnownHosts::new(dir.join(HOSTS_FILE))),
+            host_keys,
+            host,
             generations: RefCell::new(HashMap::new()),
             trees: RefCell::new(HashMap::new()),
             _lock: Some(lock),
         })
+    }
+
+    /// Opens the host-backed space in `dir`, which `signer` signs for through its host and
+    /// whose other hosts' keys `host_keys` checks. The signer's key must be the one the
+    /// space's binding names.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` is not a host-backed space, holds a key file or a `hosts` file, has
+    /// an unfinished initialization, if the signer's key is not the binding's, or if
+    /// another process has it open.
+    pub fn open_host(
+        dir: impl AsRef<Path>,
+        signer: Box<dyn Signer>,
+        host_keys: Box<dyn HostKeys>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        check_format(dir, HOST_FORMAT)?;
+        let binding = HostBinding::load(dir)?;
+        refuse_key_files(dir)?;
+        let lock = lock_space(dir)?;
+        if dir.join(INIT_RECEIPT_FILE).exists() {
+            return Err(Error::NotASpace {
+                path: dir.to_owned(),
+                reason: "its initialization did not finish; run init again to finish it".to_owned(),
+            });
+        }
+        if signer.public_key() != binding.public_key {
+            return Err(Error::HostBacked(
+                "the signer's key is not the one the space's binding names".to_owned(),
+            ));
+        }
+        Self::open_locked(dir, lock, Some(signer), host_keys, Some(binding))
+    }
+
+    /// Creates a host-backed space in `dir`, an empty private directory prepared as
+    /// `binding` with the host, whose first commit `signer` signs through the host. With an
+    /// unfinished initialization of the same binding there, finishes it with the same first
+    /// commit; on a space already initialized under `binding`, opens it and changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` holds anything else, on a binding or format that does not match, if
+    /// the signer fails or its signature does not verify, or on a file system error. A
+    /// failure leaves what was written, for a later call to finish.
+    pub fn init_host(
+        dir: impl AsRef<Path>,
+        binding: &HostBinding,
+        signer: Box<dyn Signer>,
+        host_keys: Box<dyn HostKeys>,
+        agent: Option<String>,
+        session: Option<String>,
+    ) -> Result<Self> {
+        let dir = dir.as_ref();
+        binding.validate()?;
+        if signer.public_key() != binding.public_key {
+            return Err(Error::HostBacked(
+                "the signer's key is not the one the binding names".to_owned(),
+            ));
+        }
+        let lock = lock_space(dir)?;
+        let fresh = fs::read_dir(dir)
+            .map_err(|e| Error::io("listing", dir, e))?
+            .filter_map(std::result::Result::ok)
+            .all(|entry| entry.file_name() == "space.lock");
+        if fresh {
+            for sub in ["objects", "refs/branches", "workspaces"] {
+                let path = dir.join(sub);
+                fs::create_dir_all(&path).map_err(|e| Error::io("creating", path, e))?;
+            }
+            binding.write(dir)?;
+            let format = dir.join("FORMAT");
+            fs::write(&format, format!("{HOST_FORMAT}\n"))
+                .map_err(|e| Error::io("writing", format, e))?;
+            sync_dir(dir)?;
+        } else {
+            check_format(dir, HOST_FORMAT)?;
+            if &HostBinding::load(dir)? != binding {
+                return Err(Error::HostBacked(
+                    "the directory holds a space of another binding".to_owned(),
+                ));
+            }
+        }
+        refuse_key_files(dir)?;
+        let mut space =
+            Self::open_locked(dir, lock, Some(signer), host_keys, Some(binding.clone()))?;
+        let receipt = InitReceipt::load(dir)?;
+        let main = space.branch(DEFAULT_BRANCH)?;
+        let commit = match (receipt, main) {
+            // Initialized already: report it as it is, wherever its branch has moved since.
+            (None, Some(_)) if !fresh => return Ok(space),
+            (None, None) if !fresh => {
+                return Err(Error::NotASpace {
+                    path: dir.to_owned(),
+                    reason: "a partial space without an initialization receipt".to_owned(),
+                });
+            }
+            (Some(receipt), _) => space.receipt_commit(&receipt)?,
+            (None, _) => {
+                let tree = space.put_tree(&Tree::new())?;
+                let commit = Commit {
+                    tree,
+                    parents: Vec::new(),
+                    change: ChangeId::random(),
+                    author: Author {
+                        host: binding.host_id.clone(),
+                        agent,
+                        session,
+                    },
+                    time: SystemTime::now(),
+                    message: FIRST_MESSAGE.to_owned(),
+                    predecessor: None,
+                    signature: None,
+                };
+                InitReceipt {
+                    binding_id: binding.binding_id.clone(),
+                    message: commit.signing_message(),
+                }
+                .write(dir)?;
+                commit
+            }
+        };
+        let id = space.put_commit(&commit)?;
+        match space.branch(DEFAULT_BRANCH)? {
+            None => space.create_branch(DEFAULT_BRANCH, id)?,
+            Some(head) if head == id => {}
+            Some(_) => {
+                return Err(Error::HostBacked(
+                    "main already points at another first commit".to_owned(),
+                ));
+            }
+        }
+        InitReceipt::remove(dir)?;
+        Ok(space)
+    }
+
+    /// The first commit an initialization receipt records, checked against the binding:
+    /// the stored empty tree, no parents or predecessor, the first message, this host.
+    fn receipt_commit(&self, receipt: &InitReceipt) -> Result<Commit> {
+        let binding = self.host.as_ref().expect("a host-backed space");
+        let damaged = || Error::NotASpace {
+            path: self.dir.clone(),
+            reason: format!("{INIT_RECEIPT_FILE} does not describe this space's first commit"),
+        };
+        if receipt.binding_id != binding.binding_id {
+            return Err(damaged());
+        }
+        let unsigned = receipt
+            .message
+            .strip_prefix(crate::sign::SIGNING_CONTEXT)
+            .ok_or_else(damaged)?;
+        let commit = Commit::decode(unsigned).map_err(|_| damaged())?;
+        let empty = ObjectId::compute(Kind::Tree, &Tree::new().encode());
+        if commit.signing_message() != receipt.message
+            || commit.signature.is_some()
+            || commit.tree != empty
+            || !self.contains(&empty)
+            || !commit.parents.is_empty()
+            || commit.predecessor.is_some()
+            || commit.message != FIRST_MESSAGE
+            || commit.author.host != binding.host_id
+        {
+            return Err(damaged());
+        }
+        Ok(commit)
+    }
+
+    /// The binding of a host-backed space, or `None` for a space that signs with its own
+    /// key file.
+    pub fn host_binding(&self) -> Option<&HostBinding> {
+        self.host.as_ref()
     }
 
     /// Opens a view of the space in `dir` for serving one workspace that its owner has lent
@@ -256,6 +475,7 @@ impl Space {
             tracking: TrackingRefs::new(dir.join("refs/remotes")),
             signer: None,
             host_keys: Box::new(KnownHosts::new(dir.join(HOSTS_FILE))),
+            host: None,
             generations: RefCell::new(HashMap::new()),
             trees: RefCell::new(HashMap::new()),
             _lock: None,
@@ -302,6 +522,11 @@ impl Space {
     ///
     /// Fails if `host` is empty or holds whitespace, or on a file system error.
     pub fn add_known_host(&mut self, host: &str, key: &PublicKey) -> Result<bool> {
+        if self.host.is_some() {
+            return Err(Error::HostBacked(
+                "it checks other hosts' keys through its host, not a hosts file".to_owned(),
+            ));
+        }
         KnownHosts::new(self.dir.join(HOSTS_FILE)).add(host, key)
     }
 
@@ -692,6 +917,14 @@ impl Space {
     ///
     /// Fails if the signer fails, or on a file system error.
     pub fn put_commit(&mut self, commit: &Commit) -> Result<ObjectId> {
+        if let Some(binding) = &self.host
+            && commit.author.host != binding.host_id
+        {
+            return Err(Error::HostBacked(format!(
+                "its commits are authored by its host {}, not {:?}",
+                binding.host_id, commit.author.host
+            )));
+        }
         match &self.signer {
             Some(signer) => {
                 let commit = sign_commit(commit, signer.as_ref())?;

@@ -154,6 +154,10 @@ pub enum Error {
     /// A commit could not be signed.
     #[error("signing: {0}")]
     Signing(String),
+
+    /// An operation a host-backed space refuses: it trusts and signs only through its host.
+    #[error("host-backed space: {0}")]
+    HostBacked(String),
     /// Something exists at a path already.
     #[error("{0} exists already")]
     Exists(String),
