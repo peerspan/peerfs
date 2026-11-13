@@ -988,6 +988,7 @@ dependencies = [
  "peerfs-api",
  "peerfs-core",
  "peerfs-mount",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
