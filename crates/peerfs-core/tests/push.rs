@@ -122,7 +122,7 @@ fn a_push_sends_only_missing_objects_and_fast_forwards_the_home_branch() {
         b"from the laptop\n"
     );
     // Sending again sends nothing.
-    assert!(send(&laptop, &mut server, mine).is_empty());
+    assert_eq!(send(&laptop, &mut server, mine), []);
 }
 
 #[test]

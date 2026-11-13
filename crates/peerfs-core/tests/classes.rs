@@ -75,7 +75,7 @@ fn derived_and_secret_paths_stay_in_the_workspace_and_out_of_commits() {
     // The commit kept them in the workspace.
     assert_eq!(ws.read(&space, "target/debug/app").unwrap(), b"binary");
     assert_eq!(ws.read(&space, ".env").unwrap(), b"TOKEN=abc\n");
-    assert!(ws.changes(&space).unwrap().is_empty());
+    assert_eq!(ws.changes(&space).unwrap(), []);
 
     // A change to derived or secret paths alone commits nothing.
     ws.write(&space, "target/debug/app", b"rebuilt").unwrap();

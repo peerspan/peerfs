@@ -169,7 +169,7 @@ fn files_read_write_and_commit_through_the_mount(frontend: Frontend) {
         "pub fn one() {}\npub fn two() {}\n// end\n"
     );
     assert_eq!(listing(root), ["docs", "out", "src", "tests"]);
-    assert!(listing(&root.join("docs")).is_empty());
+    assert_eq!(listing(&root.join("docs")), Vec::<String>::new());
     assert_eq!(listing(&root.join("tests")), ["lib.rs", "run.sh", "t.rs"]);
     assert_eq!(
         fs::read_link(root.join("tests/lib.rs")).unwrap(),

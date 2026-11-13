@@ -115,8 +115,8 @@ impl FromStr for ObjectId {
             return Err(ParseIdError::Length(text.len() / 2));
         }
         let mut bytes = [0; ENCODED_LEN];
-        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
-            let pair = std::str::from_utf8(pair).map_err(|_| ParseIdError::Hex)?;
+        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+            let pair = std::str::from_utf8(pair.as_slice()).map_err(|_| ParseIdError::Hex)?;
             *byte = u8::from_str_radix(pair, 16).map_err(|_| ParseIdError::Hex)?;
         }
         Self::from_bytes(&bytes)

@@ -509,7 +509,7 @@ async fn commits_from_an_untrusted_host_are_forbidden_until_its_key_is_added() {
     let server_socket = server.client.socket().to_str().unwrap().to_owned();
     let server_info = server.client.space().await.unwrap();
     let server_key = server_info.key.expect("the space signs");
-    assert!(laptop.client.hosts().await.unwrap().is_empty());
+    assert_eq!(laptop.client.hosts().await.unwrap(), []);
 
     let refused = laptop
         .client
@@ -518,7 +518,7 @@ async fn commits_from_an_untrusted_host_are_forbidden_until_its_key_is_added() {
         .unwrap_err();
     assert_eq!(refused.code(), Some("forbidden"), "{refused}");
     assert!(refused.to_string().contains(&server_key), "{refused}");
-    assert!(laptop.client.remotes().await.unwrap().is_empty());
+    assert_eq!(laptop.client.remotes().await.unwrap(), []);
 
     let bad = laptop
         .client
@@ -609,7 +609,7 @@ async fn snapshots_over_the_api_are_replaced_by_one_signed_commit() {
     assert_eq!(log[0].id, commit);
     assert_eq!(log[0].predecessor, Some(taken[1].clone()));
     assert!(log[0].signed_by.is_some());
-    assert!(client.snapshots("w").await.unwrap().is_empty());
+    assert_eq!(client.snapshots("w").await.unwrap(), []);
     assert_eq!(client.workspace("w").await.unwrap().snapshot, None);
 
     let unknown_field = client
