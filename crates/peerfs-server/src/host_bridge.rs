@@ -95,7 +95,7 @@ impl HostClient {
                 .filter(|left| !left.is_zero())
                 .ok_or_else(|| unavailable("it did not answer in time"))
         };
-        let mut stream = UnixStream::connect(&self.socket).map_err(unavailable)?;
+        let mut stream = connect(&self.socket, started)?;
         stream
             .set_write_timeout(Some(remaining()?))
             .map_err(unavailable)?;
@@ -219,6 +219,60 @@ impl HostClient {
         }
         Ok(())
     }
+}
+
+/// Connects to `socket` within what is left of the deadline from `started`. A blocking
+/// connect could wait forever on a host that has stopped accepting connections and whose
+/// backlog is full, while the space's lock is held for signing, so the socket connects
+/// without blocking: a full backlog refuses at once with `EAGAIN`, retried until the
+/// deadline, and a connection in progress is waited for.
+fn connect(socket: &Path, started: Instant) -> Result<UnixStream> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::io::Errno;
+    use rustix::net::{
+        AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect as connect_socket,
+        socket_with, sockopt,
+    };
+    let address = SocketAddrUnix::new(socket).map_err(|e| unavailable(io::Error::from(e)))?;
+    let fd = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|e| unavailable(io::Error::from(e)))?;
+    let timed_out = || unavailable("it did not accept the connection in time");
+    loop {
+        match connect_socket(&fd, &address) {
+            Ok(()) => break,
+            Err(Errno::AGAIN | Errno::INTR) => {
+                if started.elapsed() >= DEADLINE {
+                    return Err(timed_out());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(Errno::INPROGRESS) => {
+                let left = DEADLINE
+                    .checked_sub(started.elapsed())
+                    .ok_or_else(timed_out)?;
+                let timeout = Timespec::try_from(left).map_err(|_| timed_out())?;
+                let mut fds = [PollFd::new(&fd, PollFlags::OUT)];
+                if poll(&mut fds, Some(&timeout)).map_err(|e| unavailable(io::Error::from(e)))? == 0
+                {
+                    return Err(timed_out());
+                }
+                if let Err(e) =
+                    sockopt::socket_error(&fd).map_err(|e| unavailable(io::Error::from(e)))?
+                {
+                    return Err(unavailable(io::Error::from(e)));
+                }
+                break;
+            }
+            Err(e) => return Err(unavailable(io::Error::from(e))),
+        }
+    }
+    rustix::io::ioctl_fionbio(&fd, false).map_err(|e| unavailable(io::Error::from(e)))?;
+    Ok(UnixStream::from(fd))
 }
 
 /// What a refusal from the host means for a commit.
@@ -349,6 +403,37 @@ mod tests {
         assert!(
             parse_response(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\n{}")
                 .is_err()
+        );
+    }
+
+    /// A host that stops accepting with its backlog full: connecting fails within the
+    /// deadline instead of hanging.
+    #[test]
+    fn a_host_with_a_full_backlog_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.sock");
+        // A listener with a backlog of one, which never accepts.
+        let listener = rustix::net::socket(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(&listener, &rustix::net::SocketAddrUnix::new(&path).unwrap()).unwrap();
+        rustix::net::listen(&listener, 1).unwrap();
+        // Fill the backlog with connections the listener never accepts.
+        let mut held = Vec::new();
+        while let Ok(stream) = connect(&path, Instant::now()) {
+            held.push(stream);
+            assert!(held.len() < 100, "the backlog never filled");
+        }
+        let started = Instant::now();
+        let client = HostClient::new(&path);
+        assert!(client.binding("space_x").is_err());
+        let took = started.elapsed();
+        assert!(
+            took >= DEADLINE && took < DEADLINE + Duration::from_secs(2),
+            "{took:?}"
         );
     }
 
