@@ -379,9 +379,17 @@ impl Space {
                     reason: "a partial space without an initialization receipt".to_owned(),
                 });
             }
-            (Some(receipt), _) => space.receipt_commit(&receipt)?,
+            (Some(receipt), _) => {
+                // The empty tree is canonical, so a crash that lost it from an unsynced pack
+                // is repaired by storing it again, and the receipt still describes it.
+                space.put_tree(&Tree::new())?;
+                space.store.sync()?;
+                space.receipt_commit(&receipt)?
+            }
             (None, _) => {
                 let tree = space.put_tree(&Tree::new())?;
+                // Durable before the receipt that names it, which is synced at once.
+                space.store.sync()?;
                 let commit = Commit {
                     tree,
                     parents: Vec::new(),

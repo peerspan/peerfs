@@ -495,6 +495,42 @@ mod tests {
         assert!(!dir.path().join(INIT_RECEIPT_FILE).exists());
     }
 
+    /// A crash after the receipt was written can lose objects from an unsynced pack; the
+    /// receipt's empty tree is canonical, so resuming stores it again.
+    #[test]
+    fn a_resume_restores_a_lost_empty_tree() {
+        use crate::Space;
+        let dir = private_dir();
+        let binding = binding();
+        let host = TestHost::new();
+        host.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            Space::init_host(
+                dir.path(),
+                &binding,
+                Box::new(host),
+                Box::new(NoHosts),
+                None,
+                None
+            )
+            .is_err()
+        );
+        let objects = dir.path().join("objects");
+        fs::remove_dir_all(&objects).unwrap();
+        fs::create_dir(&objects).unwrap();
+        let space = Space::init_host(
+            dir.path(),
+            &binding,
+            Box::new(TestHost::new()),
+            Box::new(NoHosts),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(space.branch("main").unwrap().is_some());
+        assert!(!dir.path().join(INIT_RECEIPT_FILE).exists());
+    }
+
     #[test]
     fn host_backed_spaces_refuse_key_files_and_other_bindings() {
         use crate::Space;
