@@ -306,8 +306,8 @@ mod tests {
             names(r#"{"cwd": "/work/agent 10"}"#).is_empty(),
             "by component"
         );
-        assert!(names(r#"{"cwd": "/other"}"#).is_empty());
-        assert!(names("{}").is_empty());
+        assert_eq!(names(r#"{"cwd": "/other"}"#), Vec::<String>::new());
+        assert_eq!(names("{}"), Vec::<String>::new());
     }
 
     #[test]

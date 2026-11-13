@@ -324,7 +324,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temporary directory");
         let hosts = KnownHosts::new(dir.path().join("hosts"));
         let (a, b) = (PublicKey([1; 32]), PublicKey([2; 32]));
-        assert!(hosts.list().expect("empty").is_empty());
+        assert_eq!(hosts.list().expect("empty"), Vec::new());
         assert!(hosts.add("laptop", &a).expect("add"));
         assert!(hosts.add("laptop", &b).expect("add"));
         assert!(!hosts.add("laptop", &a).expect("add"));

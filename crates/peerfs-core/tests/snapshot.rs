@@ -94,7 +94,7 @@ fn committing_replaces_the_snapshots_with_one_signed_commit() {
     // A new change starts, with no snapshots.
     assert_ne!(ws.change(), change);
     assert_eq!(ws.snapshot(), None);
-    assert!(space.snapshots(&ws).unwrap().is_empty());
+    assert_eq!(space.snapshots(&ws).unwrap(), []);
     assert_eq!(
         space.history(commit).unwrap().len(),
         2,

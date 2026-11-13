@@ -350,8 +350,8 @@ impl ChangeId {
             return None;
         }
         let mut bytes = [0; 16];
-        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
-            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair.as_slice()).ok()?, 16).ok()?;
         }
         Some(Self(bytes))
     }
