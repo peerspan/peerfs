@@ -9,7 +9,7 @@ use crate::classes::OwnerRules;
 use crate::codec::len_u64;
 use crate::edit::TreeEdit;
 use crate::error::{Error, Result};
-use crate::host::{HostBinding, INIT_RECEIPT_FILE, InitReceipt};
+use crate::host::{HostBinding, INIT_RECEIPT_FILE, InitReceipt, write_new};
 use crate::id::ObjectId;
 use crate::merge::{Conflict, merge_trees};
 use crate::object::{
@@ -352,10 +352,11 @@ impl Space {
                 let path = dir.join(sub);
                 fs::create_dir_all(&path).map_err(|e| Error::io("creating", path, e))?;
             }
+            // Everything the receipt relies on is durable before it is written: the
+            // directories, the binding and FORMAT, each file synced, then their directories.
+            sync_dir(&dir.join("refs"))?;
             binding.write(dir)?;
-            let format = dir.join("FORMAT");
-            fs::write(&format, format!("{HOST_FORMAT}\n"))
-                .map_err(|e| Error::io("writing", format, e))?;
+            write_new(&dir.join("FORMAT"), format!("{HOST_FORMAT}\n").as_bytes())?;
             sync_dir(dir)?;
         } else {
             check_format(dir, HOST_FORMAT)?;
