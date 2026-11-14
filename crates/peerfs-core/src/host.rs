@@ -245,7 +245,7 @@ impl InitReceipt {
 }
 
 /// Writes a new file with mode 0600, syncs it and its directory.
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = File::options()
         .write(true)
         .create_new(true)
