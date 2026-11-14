@@ -78,7 +78,7 @@ the request names.
 | `POST /v1/workspaces/{name}/snapshot` | Snapshot the workspace (`{message?, caller}`); the outcome is `snapshot` or `unchanged` |
 | `GET /v1/workspaces/{name}/snapshots` | The current change's snapshots, newest first |
 | `POST /v1/workspaces/{name}/restore` | Restore the source paths to one of them (`{snapshot, caller}`, the snapshot whole or by the start of its ID); returns `{target, before?, snapshot?}`. `conflict` once the change has moved onto a new base |
-| `POST /v1/objects/fetch` | Objects by id (`{ids}`, at most 256), as `application/octet-stream`; those not held are left out |
+| `POST /v1/objects/fetch` | Objects by id (`{ids}`, at most 256), as `application/octet-stream`; those not held are left out. With `within: BRANCH`, only if that branch's current head reaches every one, through commits' trees and parents, trees' entries and files' chunks, but never a commit's snapshot `predecessor`; otherwise 404, naming none. The Peerspan host serves a shared branch's readers this way |
 | `POST /v1/pull` | Pull a branch from another server (`{from, branch}`, `from` its socket); the space is held only between fetches |
 | `GET /v1/remotes` | Tracking references, with when each was pulled |
 | `POST, DELETE /v1/workspaces/{name}/mount` | Mount the workspace (`{path, frontend}`: an absolute empty directory, and `fuse`, the default, or `nfs`); unmount it, `conflict` while it is in use |
