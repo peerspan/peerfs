@@ -353,7 +353,30 @@ impl Client {
     ///
     /// Fails with `invalid` for more than 256 ids or a malformed id.
     pub async fn fetch_objects(&self, ids: &[String]) -> Result<Bytes, ClientError> {
-        let request = FetchRequest { ids: ids.to_vec() };
+        let request = FetchRequest {
+            ids: ids.to_vec(),
+            within: None,
+        };
+        self.call_json(Method::POST, "/v1/objects/fetch", Some(&request))
+            .await
+    }
+
+    /// The objects `ids`, all of which `branch`'s current head must reach, encoded by
+    /// `peerfs_core::encode_objects`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `not_found` when the branch does not reach every one, naming none, and
+    /// with `invalid` for more than 256 ids or a malformed id.
+    pub async fn fetch_objects_within(
+        &self,
+        ids: &[String],
+        branch: &str,
+    ) -> Result<Bytes, ClientError> {
+        let request = FetchRequest {
+            ids: ids.to_vec(),
+            within: Some(branch.to_owned()),
+        };
         self.call_json(Method::POST, "/v1/objects/fetch", Some(&request))
             .await
     }

@@ -458,6 +458,45 @@ impl Space {
         Ok(commit)
     }
 
+    /// Whether `branch`'s head reaches every one of `ids`: through each commit's tree and
+    /// parents, each tree's entries and each file's chunks. A commit's `predecessor`, its
+    /// local snapshot, is a weak link and is not followed, so snapshots, and objects only
+    /// they reach, are never reached. A branch that does not exist reaches nothing.
+    ///
+    /// The walk stops as soon as every one is found, and at worst visits the branch's whole
+    /// history once.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `branch` is not a valid name, or an object it reaches is missing or corrupt.
+    pub fn branch_reaches(&self, branch: &str, ids: &[ObjectId]) -> Result<bool> {
+        let Some(head) = self.branch(branch)? else {
+            return Ok(false);
+        };
+        let mut wanted: HashSet<ObjectId> = ids.iter().copied().collect();
+        let mut seen = HashSet::new();
+        let mut stack = vec![(head, Kind::Commit)];
+        while let Some((id, kind)) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            wanted.remove(&id);
+            if wanted.is_empty() {
+                return Ok(true);
+            }
+            if kind == Kind::Blob {
+                continue;
+            }
+            let bytes = self.object(id, kind)?;
+            for (child, child_kind) in crate::sync::references(id, kind, &bytes)? {
+                if !seen.contains(&child) {
+                    stack.push((child, child_kind));
+                }
+            }
+        }
+        Ok(wanted.is_empty())
+    }
+
     /// The binding of a host-backed space, or `None` for a space that signs with its own
     /// key file.
     pub fn host_binding(&self) -> Option<&HostBinding> {

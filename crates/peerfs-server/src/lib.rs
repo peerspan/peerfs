@@ -924,7 +924,15 @@ async fn fetch_objects(
                 .map_err(|e| ApiError::invalid(format!("object {id}: {e}")))
         })
         .collect::<ApiResult<Vec<_>>>()?;
+    let within = request.within;
     let encoded = with_space(&state, move |space, _| {
+        if let Some(branch) = &within
+            && !space.branch_reaches(branch, &ids)?
+        {
+            return Err(ApiError::from(Error::NotFound(
+                "the objects are not all reached by that branch".to_owned(),
+            )));
+        }
         let mut objects = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(object) = space.raw_object(id)? {

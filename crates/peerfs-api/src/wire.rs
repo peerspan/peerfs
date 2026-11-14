@@ -387,6 +387,10 @@ pub enum CommitResponse {
 pub struct FetchRequest {
     /// The objects wanted.
     pub ids: Vec<String>,
+    /// A branch whose current head must reach every one of `ids`, or the whole fetch is
+    /// refused with 404, naming none. Without it, any object the space holds is returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<String>,
 }
 
 /// `POST /v1/pull`: fetch a branch and its history from another space's server.

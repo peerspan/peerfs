@@ -380,6 +380,42 @@ async fn pull_and_fetch_reject_bad_requests() {
 }
 
 #[tokio::test]
+async fn fetch_within_a_branch_serves_only_what_its_head_reaches() {
+    let server = start_on("server", None).await;
+    commit_files(&server.client, "w", &[("a.txt", "one\n")]).await;
+    let head = server
+        .client
+        .branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|branch| branch.name == "main")
+        .unwrap()
+        .head;
+    let batch = server
+        .client
+        .fetch_objects_within(std::slice::from_ref(&head), "main")
+        .await
+        .unwrap();
+    assert_ne!(batch.len(), 0);
+    // A branch that does not exist, or an id the branch does not reach, refuses the whole
+    // fetch with not_found, naming none.
+    let missing = server
+        .client
+        .fetch_objects_within(std::slice::from_ref(&head), "gone")
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Some("not_found"));
+    let unreached = format!("01{}", "ab".repeat(32));
+    let refusal = server
+        .client
+        .fetch_objects_within(&[head, unreached], "main")
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.code(), Some("not_found"));
+}
+
+#[tokio::test]
 async fn push_is_refused_when_the_home_moved_then_pull_merge_and_push_again() {
     let server = start_on("server", None).await;
     let laptop = start_on("laptop", None).await;
