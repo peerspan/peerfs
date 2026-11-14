@@ -359,33 +359,66 @@ impl Signer for HostSigner {
     }
 }
 
-/// The host keys a host-backed space knows: its own host's, from its binding. Checking
-/// another host's key needs the host's identity history, which comes with activation;
-/// until then a commit from another host is refused rather than trusted.
+/// The host keys a host-backed space trusts: its own host's, from its binding, and any
+/// other host the host recognizes from its network's admission history
+/// (`POST /v1/fs/spaces/{id}/host-keys/check`). Recognition is identity history, not
+/// current access. When the host cannot answer, the check fails rather than trusting.
 #[derive(Debug)]
-pub struct BindingHostKeys {
-    host_id: String,
-    key: PublicKey,
+pub struct HostKeyCheck {
+    client: HostClient,
+    binding: HostBinding,
 }
 
-impl BindingHostKeys {
-    /// The keys of the host `binding` names.
+impl HostKeyCheck {
+    /// Checks keys for the space bound as `binding`, through the host at its socket.
     pub fn new(binding: &HostBinding) -> Self {
         Self {
-            host_id: binding.host_id.clone(),
-            key: binding.public_key,
+            client: HostClient::new(binding.host_socket.clone()),
+            binding: binding.clone(),
         }
     }
 }
 
-impl HostKeys for BindingHostKeys {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recognition {
+    host_id: String,
+    public_key: String,
+    recognized: bool,
+}
+
+impl HostKeys for HostKeyCheck {
     fn is_key_of(&self, host: &str, key: &PublicKey) -> Result<bool> {
-        if host == self.host_id {
-            return Ok(*key == self.key);
+        if host == self.binding.host_id {
+            return Ok(*key == self.binding.public_key);
         }
-        Err(Error::HostBacked(
-            "checking another host's key through the host is not available yet".to_owned(),
-        ))
+        // An author that is not a host ID, such as an old free-form alias, is never one.
+        let hex = host.strip_prefix("host_").unwrap_or_default();
+        if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Ok(false);
+        }
+        let key_text = key.to_string();
+        let body = serde_json::json!({
+            "binding_id": self.binding.binding_id,
+            "host_id": host,
+            "public_key": key_text,
+        });
+        let (status, body) = self.client.request(
+            "POST",
+            &format!("/v1/fs/spaces/{}/host-keys/check", self.binding.space_id),
+            Some(body.to_string().as_bytes()),
+        )?;
+        if status != 200 {
+            return Err(refused(status, &body));
+        }
+        let answer: Recognition = serde_json::from_slice(&body)
+            .map_err(|_| unavailable("its key check response is malformed"))?;
+        if answer.host_id != host || answer.public_key != key_text {
+            return Err(Error::HostBacked(
+                "the host answered about another host or key".to_owned(),
+            ));
+        }
+        Ok(answer.recognized)
     }
 }
 
@@ -435,6 +468,109 @@ mod tests {
             took >= DEADLINE && took < DEADLINE + Duration::from_secs(2),
             "{took:?}"
         );
+    }
+
+    /// A host that answers each connection with `response`, recording the requests.
+    fn fake_host(
+        dir: &Path,
+        responses: Vec<String>,
+    ) -> (PathBuf, std::thread::JoinHandle<Vec<String>>) {
+        let path = dir.join("admin.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap();
+                requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (path, handle)
+    }
+
+    fn ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn test_binding(socket: PathBuf) -> HostBinding {
+        let key: PublicKey = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+            .parse()
+            .unwrap();
+        HostBinding {
+            space_id: format!("space_{}", "a".repeat(32)),
+            binding_id: format!("fsbind_{}", "b".repeat(32)),
+            network_id: format!("net_{}", "c".repeat(64)),
+            context_id: format!("ctx_{}", "d".repeat(64)),
+            host_id: peerfs_core::host_id_of(&key),
+            public_key: key,
+            host_socket: socket,
+        }
+    }
+
+    #[test]
+    fn the_own_host_and_aliases_are_answered_locally() {
+        let binding = test_binding(PathBuf::from("/nonexistent/admin.sock"));
+        let check = HostKeyCheck::new(&binding);
+        assert!(
+            check
+                .is_key_of(&binding.host_id, &binding.public_key)
+                .unwrap()
+        );
+        let other: PublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            .parse()
+            .unwrap();
+        assert!(!check.is_key_of(&binding.host_id, &other).unwrap());
+        assert!(!check.is_key_of("laptop", &binding.public_key).unwrap());
+    }
+
+    #[test]
+    fn other_hosts_are_checked_with_the_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let other: PublicKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            .parse()
+            .unwrap();
+        let host = peerfs_core::host_id_of(&other);
+        let answer = |recognized: bool, key: &str| {
+            ok(&format!(
+                r#"{{"host_id":"{host}","public_key":"{key}","recognized":{recognized}}}"#
+            ))
+        };
+        let body = r#"{"code":"conflict","error":"conflict"}"#;
+        let refusal = format!(
+            "HTTP/1.1 409 Conflict\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let (socket, server) = fake_host(
+            dir.path(),
+            vec![
+                answer(true, &other.to_string()),
+                answer(false, &other.to_string()),
+                answer(true, "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="),
+                refusal,
+            ],
+        );
+        let binding = test_binding(socket);
+        let check = HostKeyCheck::new(&binding);
+        assert!(check.is_key_of(&host, &other).unwrap());
+        assert!(!check.is_key_of(&host, &other).unwrap());
+        // An answer about another key, or a refusal, is an error, never trust.
+        assert!(check.is_key_of(&host, &other).is_err());
+        assert!(matches!(
+            check.is_key_of(&host, &other),
+            Err(Error::HostBacked(_))
+        ));
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with(&format!(
+            "POST /v1/fs/spaces/{}/host-keys/check HTTP/1.1",
+            binding.space_id
+        )));
+        assert!(requests[0].contains(&format!(r#""binding_id":"{}""#, binding.binding_id)));
     }
 
     #[test]
