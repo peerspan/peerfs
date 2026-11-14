@@ -23,7 +23,7 @@ use peerfs_api::{
     GcRequest, GcResponse, MergeResponse, Revision, SnapshotResponse,
 };
 use peerfs_core::{Author, HostBinding, Space};
-use peerfs_server::host_bridge::{BindingHostKeys, HostClient, HostSigner};
+use peerfs_server::host_bridge::{HostClient, HostKeyCheck, HostSigner};
 use peerfs_server::{Options, serve, socket_path};
 
 /// The file in a space naming the host its server records on commits.
@@ -300,7 +300,7 @@ async fn init_host_backed(
             &dir,
             &binding,
             Box::new(HostSigner::new(binding.clone())),
-            Box::new(BindingHostKeys::new(&binding)),
+            Box::new(HostKeyCheck::new(&binding)),
             agent,
             session,
         )
@@ -357,7 +357,7 @@ fn open_host_backed(dir: &Path) -> peerfs_core::Result<Space> {
     Space::open_host(
         dir,
         Box::new(HostSigner::new(binding.clone())),
-        Box::new(BindingHostKeys::new(&binding)),
+        Box::new(HostKeyCheck::new(&binding)),
     )
 }
 
