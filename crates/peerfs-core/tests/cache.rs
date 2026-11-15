@@ -382,6 +382,33 @@ fn an_edit_of_the_owner_rules_reclassifies_cached_paths_of_a_value_in_use() {
 }
 
 #[test]
+fn a_new_base_reclassifies_cached_paths_of_a_value_in_use() {
+    let (_dir, mut space) = space();
+    let mut build = space.create_workspace("build", "main").unwrap();
+    build_output(&space, &mut build, "gen/out.rs", "generated", long_ago(1));
+    space.save_cache("bc", "build").unwrap();
+
+    let mut ws = space
+        .create_workspace_with_cache("w", "main", Some("bc"))
+        .unwrap();
+    assert_eq!(ws.read(&space, "gen/out.rs").unwrap(), b"generated");
+    let before = ws.base();
+
+    // Another workspace stops `gen/` being derived; committing the clean one follows it.
+    let mut edit = space.create_workspace("edit", "main").unwrap();
+    edit.write(&space, ".gitignore", b"# nothing\n").unwrap();
+    commit(&mut space, &mut edit);
+    space
+        .commit_workspace(&mut ws, "follow", &author())
+        .unwrap();
+    assert_ne!(ws.base(), before);
+    assert!(matches!(
+        ws.read(&space, "gen/out.rs"),
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[test]
 fn cached_files_are_copied_up_on_write_and_stay_removed() {
     let (_dir, mut space) = space();
     let mut build = space.create_workspace("build", "main").unwrap();
