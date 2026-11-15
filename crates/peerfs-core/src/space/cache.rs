@@ -24,7 +24,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::Space;
+use super::{Space, branch_name};
 use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::{ChangeId, Name};
@@ -259,14 +259,7 @@ impl Space {
             return Err(Error::WorkspaceExists(workspace.to_owned()));
         }
         let generation = self.generation(&name);
-        Workspace::create(
-            dir,
-            name,
-            super::branch_name(branch)?,
-            head,
-            generation,
-            holding,
-        )
+        Workspace::create(dir, name, branch_name(branch)?, head, generation, holding)
     }
 
     /// Saves the derived files `workspace` shows, its overlay's and those of a cache version

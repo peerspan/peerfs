@@ -1302,16 +1302,7 @@ impl Space {
     ///
     /// Fails if the workspace exists, the branch does not, or on a file system error.
     pub fn create_workspace(&mut self, workspace: &str, branch: &str) -> Result<Workspace> {
-        let name = Name::try_from(workspace)?;
-        let head = self
-            .branch(branch)?
-            .ok_or_else(|| Error::NoSuchBranch(branch.to_owned()))?;
-        let dir = self.workspace_dir(&name);
-        if dir.exists() {
-            return Err(Error::WorkspaceExists(workspace.to_owned()));
-        }
-        let generation = self.generation(&name);
-        Workspace::create(dir, name, branch_name(branch)?, head, generation, None)
+        self.create_workspace_with_cache(workspace, branch, None)
     }
 
     /// Opens an existing workspace.
