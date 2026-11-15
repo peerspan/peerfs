@@ -47,6 +47,9 @@ const KEY_FILE: &str = "signing.key";
 /// The owner's path-class rules.
 const CLASSES_FILE: &str = "classes";
 
+/// The owner's `classes` file's modification time, inode and length.
+pub(crate) type RulesStamp = (SystemTime, u64, u64);
+
 /// The keys this space trusts for other hosts, until the host daemon supplies them.
 const HOSTS_FILE: &str = "hosts";
 
@@ -554,6 +557,15 @@ impl Space {
     /// Fails if the file cannot be read or is malformed.
     pub fn owner_rules(&self) -> Result<OwnerRules> {
         OwnerRules::load(&self.dir.join(CLASSES_FILE))
+    }
+
+    /// How the owner's `classes` file looks on disk, which changes when it is written,
+    /// replaced or removed, so a value that remembered classes can tell. `None` when it is
+    /// missing.
+    pub(crate) fn owner_rules_stamp(&self) -> Option<RulesStamp> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = fs::metadata(self.dir.join(CLASSES_FILE)).ok()?;
+        Some((meta.modified().ok()?, meta.ino(), meta.len()))
     }
 
     /// The host keys listed in the space's `hosts` file.

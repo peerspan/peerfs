@@ -22,7 +22,7 @@ use crate::id::ObjectId;
 use crate::object::{ChangeId, Content, Entry, FileMode, Name, Tree};
 use crate::path::TreePath;
 use crate::space::cache::{DATES, FILES, copy_tree, version_dir};
-use crate::space::{Space, mode_of, permissions};
+use crate::space::{RulesStamp, Space, mode_of, permissions};
 use crate::store::sync_dir;
 
 /// What kind of entry a path is.
@@ -146,8 +146,10 @@ pub struct Workspace {
     /// The held version's `dates`, loaded on first use.
     dates: Option<Stamps>,
     /// Classes of paths the cache layer was asked about, by path and whether it is a
-    /// directory. Forgotten when a `.gitignore` changes.
+    /// directory. Forgotten when a `.gitignore` or the owner's rules change.
     classes: RefCell<HashMap<(TreePath, bool), Class>>,
+    /// The owner's rules file as it was when `classes` were worked out.
+    classes_rules: Cell<Option<RulesStamp>>,
 }
 
 /// Counts a workspace's changes, shared by every value of it that a space opened. The
@@ -398,6 +400,7 @@ impl Workspace {
             cache_whiteouts: BTreeSet::new(),
             dates: None,
             classes: RefCell::new(HashMap::new()),
+            classes_rules: Cell::new(None),
         };
         let mut workspace = workspace;
         workspace.save()?;
@@ -470,6 +473,7 @@ impl Workspace {
             cache_whiteouts,
             dates: None,
             classes: RefCell::new(HashMap::new()),
+            classes_rules: Cell::new(None),
         })
     }
 
@@ -848,6 +852,15 @@ impl Workspace {
     }
 
     /// Whether the held version's entry at `path`, or one of its directories, was removed.
+    /// Whether the held version has an entry at `path` that no cache whiteout hides,
+    /// whether or not the layer shows it there.
+    fn cache_holds(&self, path: &TreePath) -> bool {
+        !self.cache_hidden(path)
+            && self
+                .cache_local(path)
+                .is_some_and(|local| fs::symlink_metadata(local).is_ok())
+    }
+
     fn cache_hidden(&self, path: &TreePath) -> bool {
         if self.cache_whiteouts.is_empty() {
             return false;
@@ -928,8 +941,15 @@ impl Workspace {
     }
 
     /// The class of `path`, an entry of `kind`, given its directories' classes, which are
-    /// worked out too. Remembered until [`Workspace::forget_classes`].
+    /// worked out too. Remembered until [`Workspace::forget_classes`] or the owner's rules
+    /// file changes.
     fn class_of(&self, space: &Space, path: &TreePath, kind: EntryKind) -> Result<Class> {
+        // The owner may have edited their rules since, which no generation counts.
+        let rules_now = space.owner_rules_stamp();
+        if self.classes_rules.get() != rules_now {
+            self.forget_classes();
+            self.classes_rules.set(rules_now);
+        }
         let names = path.components();
         let mut rules = None;
         let mut prefix = TreePath::root();
@@ -1328,7 +1348,7 @@ impl Workspace {
         if from_in_base {
             self.add_whiteout(from)?;
         }
-        if from_in_cache {
+        if from_in_cache || (from_in_base && self.cache_holds(from)) {
             self.add_cache_whiteout(from)?;
         }
         if !source_is_dir {
@@ -1356,9 +1376,10 @@ impl Workspace {
         if in_base {
             self.add_whiteout(&tree_path)?;
         }
-        // A base removal hides the cache's entry there too.
         let in_cache = !in_base && self.cached(space, &tree_path, view)?.is_some();
-        if in_cache {
+        // A base whiteout hides the cache's entries there too, but a commit drops it, so a
+        // base directory that leads to cached files gets a cache whiteout as well.
+        if in_cache || (in_base && self.cache_holds(&tree_path)) {
             self.add_cache_whiteout(&tree_path)?;
         }
         if is_gitignore(&tree_path) {
