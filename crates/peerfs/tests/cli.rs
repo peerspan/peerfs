@@ -318,7 +318,7 @@ fn a_mounted_workspace_is_edited_as_a_directory_and_committed() {
 
     std::fs::create_dir(mountpoint.join("src")).expect("mkdir");
     std::fs::write(mountpoint.join("src/main.rs"), "fn main() {}\n").expect("write");
-    assert_eq!(run(&["ws", "status", "w"]).trim(), "A src/main.rs");
+    assert_eq!(run(&["ws", "status", "w"]), "A src/main.rs\nno cache\n");
     run(&["ws", "commit", "w", "-m", "From the mount"]);
     assert_eq!(
         std::fs::read_to_string(mountpoint.join("src/main.rs")).expect("read"),
@@ -479,4 +479,186 @@ fn gc_reports_and_keeps_what_is_new() {
         real.starts_with("dropped 0 snapshots and 0 objects"),
         "{real}"
     );
+}
+
+#[test]
+fn caches_are_saved_from_a_workspace_and_held_by_new_ones() {
+    let space = new_space();
+    let run = |args: &[&str]| ok(&peerfs(&space.path, "a", args, None));
+    run(&["ws", "create", "setup"]);
+    ok(&peerfs(
+        &space.path,
+        "a",
+        &["ws", "write", "setup", "src/lib.rs"],
+        Some("pub fn one() {}\n"),
+    ));
+    run(&["ws", "commit", "setup", "-m", "Add the library"]);
+    let head = run(&["branches"]);
+    let head = head.split(' ').next().expect("a head");
+
+    assert_eq!(
+        run(&["ws", "create", "build", "--from", "main", "--cache", "bc"]),
+        format!("build follows main at {head}, with no cache: bc does not exist\n")
+    );
+    assert_eq!(run(&["ws", "status", "build"]), "no cache\n");
+    let output = "x".repeat(10);
+    ok(&peerfs(
+        &space.path,
+        "a",
+        &["ws", "write", "build", "target/debug/out"],
+        Some(&output),
+    ));
+    let saved = run(&["cache", "save", "bc", "--from", "build"]);
+    assert!(
+        saved.starts_with(&format!("bc {head} saved 20"))
+            && saved.ends_with(", 10 bytes, 1 version\n"),
+        "{saved}"
+    );
+    assert_eq!(run(&["cache", "ls"]), saved);
+    let listed: serde_json::Value =
+        serde_json::from_str(&run(&["cache", "ls", "--json"])).expect("JSON");
+    assert_eq!(listed[0]["name"], "bc");
+    assert_eq!(listed[0]["commit"], head);
+    assert_eq!(listed[0]["bytes"], 10);
+    assert_eq!(listed[0]["versions"], 1);
+
+    let created = run(&["ws", "create", "w", "--cache", "bc"]);
+    assert_eq!(
+        created,
+        format!("w follows main at {head}, with cache bc from {head}\n")
+    );
+    assert_eq!(run(&["ws", "read", "w", "target/debug/out"]), output);
+    let status = run(&["ws", "status", "w"]);
+    assert!(
+        status.starts_with("cache bc version ")
+            && status.ends_with(&format!(", built from {head}\n")),
+        "{status}"
+    );
+
+    run(&["cache", "rm", "bc"]);
+    assert_eq!(run(&["cache", "ls"]), "");
+    assert_eq!(run(&["ws", "read", "w", "target/debug/out"]), output);
+    let missing = peerfs(&space.path, "a", &["cache", "rm", "bc"], None);
+    assert!(!missing.status.success());
+}
+
+/// The names in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("listing")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The cache version the workspace `name` of the space at `space` holds, from its state.
+fn held_version(space: &Path, name: &str) -> String {
+    let state =
+        std::fs::read_to_string(space.join("workspaces").join(name).join("state")).expect("state");
+    state
+        .lines()
+        .find_map(|line| line.strip_prefix("cache "))
+        .and_then(|rest| rest.split(' ').nth(1))
+        .expect("the workspace holds a version")
+        .to_owned()
+}
+
+#[test]
+fn a_confined_vhost_user_process_sees_only_the_cache_version_its_workspace_holds() {
+    use std::os::unix::net::UnixStream;
+
+    let space = new_space();
+    let run = |args: &[&str]| ok(&peerfs(&space.path, "a", args, None));
+    run(&["ws", "create", "build"]);
+    ok(&peerfs(
+        &space.path,
+        "a",
+        &["ws", "write", "build", "target/out"],
+        Some("built"),
+    ));
+    run(&["cache", "save", "one", "--from", "build"]);
+    run(&["ws", "create", "other"]);
+    ok(&peerfs(
+        &space.path,
+        "a",
+        &["ws", "write", "other", "target/out"],
+        Some("other"),
+    ));
+    run(&["cache", "save", "two", "--from", "other"]);
+    run(&["ws", "create", "vm", "--cache", "one"]);
+    let versions = space.path.join("caches/versions");
+    assert_eq!(std::fs::read_dir(&versions).expect("versions").count(), 2);
+
+    let socket = space.path.parent().expect("parent").join("vm.sock");
+    let mut child = Command::new(BINARY)
+        .arg("--space")
+        .arg(&space.path)
+        .args(["ws", "vhost-user", "vm"])
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary starts");
+    let started = Instant::now();
+    while !socket.exists() {
+        assert!(child.try_wait().expect("waiting").is_none(), "it exited");
+        assert!(started.elapsed() < Duration::from_secs(10), "no socket");
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Connecting as a VMM would makes it confine itself and remove the socket's file.
+    let vmm = UnixStream::connect(&socket).expect("connect");
+    let root = PathBuf::from(format!("/proc/{}/root", child.id()));
+    let mut confined = false;
+    while started.elapsed() < Duration::from_secs(10) {
+        if let Some(status) = child.try_wait().expect("waiting") {
+            let mut stderr = String::new();
+            std::io::Read::read_to_string(&mut child.stderr.take().expect("stderr"), &mut stderr)
+                .expect("stderr");
+            // Without user namespaces this machine cannot confine; there is nothing to see.
+            assert!(stderr.contains("confining"), "{status}: {stderr}");
+            eprintln!("not confined here: {stderr}");
+            return;
+        }
+        if root.join("workspaces/vm").exists() {
+            confined = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(confined, "the process confined itself");
+    let held = held_version(&space.path, "vm");
+    assert_eq!(names(&root.join("caches")), ["versions"]);
+    assert_eq!(
+        names(&root.join("caches/versions")),
+        std::slice::from_ref(&held)
+    );
+    let out = root
+        .join("caches/versions")
+        .join(&held)
+        .join("files/target/out");
+    assert_eq!(std::fs::read_to_string(&out).expect("read"), "built");
+    let mounts =
+        std::fs::read_to_string(format!("/proc/{}/mountinfo", child.id())).expect("mountinfo");
+    let version_mount = mounts
+        .lines()
+        .find(|line| line.contains(&format!(" /caches/versions/{held} ")))
+        .expect("the version is bound");
+    assert!(
+        version_mount
+            .split(' ')
+            .nth(5)
+            .is_some_and(|options| options.split(',').any(|o| o == "ro")),
+        "{version_mount}"
+    );
+    drop(vmm);
+    let status = child.wait().expect("waiting");
+    assert!(status.success(), "{status}");
 }

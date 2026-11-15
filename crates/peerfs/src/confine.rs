@@ -3,13 +3,15 @@
 //!
 //! The process moves into new user, mount, network, IPC and UTS namespaces and pivots into a
 //! root that holds only what serving the workspace needs: the space's objects, read-only,
-//! its `classes` file, read-only, and the workspace's own directory. It keeps one
+//! its `classes` file, read-only, the build cache version the workspace holds, if any,
+//! read-only, and the workspace's own directory. It keeps one
 //! capability, to override file permissions on its own user's files, and a seccomp filter
 //! kills it for any system call beyond those it was seen to make.
 //!
-//! What a fault in serving the guest could then reach: the workspace, and the history the
-//! space stores, which never holds secret-class files. Not the space's signing key, its
-//! other workspaces, the network, or other processes.
+//! What a fault in serving the guest could then reach: the workspace, the history the space
+//! stores, which never holds secret-class files, and the cache version the workspace holds,
+//! which only a refresh run with no secrets built. Not the space's signing key, its other
+//! workspaces, other cache versions, the network, or other processes.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -86,6 +88,13 @@ pub(crate) fn enter(space_dir: &Path, workspace: &str) -> Result<()> {
         Err(_) if !space_dir.join(CLASSES).exists() => None,
         Err(e) => return Err(e),
     };
+    // The workspace is lent, so the version it names stays held and in place.
+    let cache = match peerfs_core::held_cache_version(space_dir, workspace)
+        .context("reading which cache version the workspace holds")?
+    {
+        Some(version) => Some((open_path(&space_dir.join(&version))?, version)),
+        None => None,
+    };
     // The new root goes over the space's directory, in this mount namespace only.
     let root = space_dir;
     mount(
@@ -107,7 +116,14 @@ pub(crate) fn enter(space_dir: &Path, workspace: &str) -> Result<()> {
     if let Some(classes) = &classes {
         bind(classes, &root.join(CLASSES), Access::ReadOnly)?;
     }
-    drop((objects, workspace_dir, classes));
+    if let Some((version, at)) = &cache {
+        let target = root.join(at);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        bind(version, &target, Access::ReadOnly)?;
+    }
+    drop((objects, workspace_dir, classes, cache));
 
     let old = root.join(".old");
     fs::DirBuilder::new().mode(0o700).create(&old)?;
