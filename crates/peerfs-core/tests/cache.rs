@@ -301,6 +301,31 @@ fn cache_files_never_show_at_source_or_secret_paths_nor_over_the_base() {
 }
 
 #[test]
+fn a_gitignore_written_through_another_value_reclassifies_cached_paths() {
+    let (_dir, mut space) = space();
+    let mut build = space.create_workspace("build", "main").unwrap();
+    build_output(&space, &mut build, "gen/out.rs", "generated", long_ago(1));
+    space.save_cache("bc", "build").unwrap();
+
+    // A mount's value reads a cached file, so it has worked out that `gen/` is derived.
+    let mut mounted = space
+        .create_workspace_with_cache("w", "main", Some("bc"))
+        .unwrap();
+    assert_eq!(mounted.read(&space, "gen/out.rs").unwrap(), b"generated");
+
+    // The local API, with its own value, stops `gen/` being derived.
+    let mut api = space.workspace("w").unwrap();
+    api.write(&space, ".gitignore", b"# nothing\n").unwrap();
+
+    // The mount sees the overlay changed and no longer shows the cached file.
+    assert!(mounted.overlay_changed_elsewhere());
+    assert!(matches!(
+        mounted.read(&space, "gen/out.rs"),
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[test]
 fn cached_files_are_copied_up_on_write_and_stay_removed() {
     let (_dir, mut space) = space();
     let mut build = space.create_workspace("build", "main").unwrap();

@@ -501,11 +501,15 @@ impl Workspace {
 
     /// Whether another value of this workspace has created, replaced, moved or removed
     /// overlay files since this one last did or asked, which makes overlay files held open
-    /// from before then suspect.
+    /// from before then suspect. Such a change may have rewritten a `.gitignore`, so the
+    /// classes this value worked out are forgotten too.
     pub fn overlay_changed_elsewhere(&mut self) -> bool {
         let now = self.generation.overlay.load(Ordering::Acquire);
         let changed = now != self.seen_overlay;
         self.seen_overlay = now;
+        if changed {
+            self.forget_classes();
+        }
         changed
     }
 
