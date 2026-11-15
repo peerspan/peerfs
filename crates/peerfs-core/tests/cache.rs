@@ -326,6 +326,62 @@ fn a_gitignore_written_through_another_value_reclassifies_cached_paths() {
 }
 
 #[test]
+fn removing_a_committed_directory_keeps_its_cached_files_gone_after_commit() {
+    let (_dir, mut space) = space();
+    let mut setup = space.create_workspace("config", "main").unwrap();
+    setup.write(&space, ".peerspan/config", b"x").unwrap();
+    commit(&mut space, &mut setup);
+    space.discard_workspace("config").unwrap();
+    let mut build = space.create_workspace("build", "main").unwrap();
+    build_output(
+        &space,
+        &mut build,
+        ".peerspan/cache/output",
+        "o",
+        long_ago(1),
+    );
+    space.save_cache("bc", "build").unwrap();
+
+    let mut ws = space
+        .create_workspace_with_cache("w", "main", Some("bc"))
+        .unwrap();
+    assert_eq!(ws.read(&space, ".peerspan/cache/output").unwrap(), b"o");
+    ws.remove(&space, ".peerspan").unwrap();
+    commit(&mut space, &mut ws);
+    assert!(matches!(
+        ws.read(&space, ".peerspan/cache/output"),
+        Err(Error::NotFound(_))
+    ));
+    let reopened = space.workspace("w").unwrap();
+    assert!(
+        reopened
+            .locate(&space, &path(".peerspan"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn an_edit_of_the_owner_rules_reclassifies_cached_paths_of_a_value_in_use() {
+    let (_dir, mut space) = space();
+    let mut build = space.create_workspace("build", "main").unwrap();
+    build_output(&space, &mut build, "target/x", "x", long_ago(1));
+    space.save_cache("bc", "build").unwrap();
+
+    let ws = space
+        .create_workspace_with_cache("w", "main", Some("bc"))
+        .unwrap();
+    assert_eq!(ws.read(&space, "target/x").unwrap(), b"x");
+    fs::write(space.path().join("classes"), "[secret]\ntarget/\n").unwrap();
+    assert!(matches!(
+        ws.read(&space, "target/x"),
+        Err(Error::NotFound(_))
+    ));
+    fs::remove_file(space.path().join("classes")).unwrap();
+    assert_eq!(ws.read(&space, "target/x").unwrap(), b"x");
+}
+
+#[test]
 fn cached_files_are_copied_up_on_write_and_stay_removed() {
     let (_dir, mut space) = space();
     let mut build = space.create_workspace("build", "main").unwrap();
