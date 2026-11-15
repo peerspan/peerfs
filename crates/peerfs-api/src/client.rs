@@ -16,13 +16,13 @@ use serde::de::DeserializeOwned;
 use tokio::net::UnixStream;
 
 use crate::wire::{
-    AdvanceRequest, BranchInfo, Caller, ChangeInfo, CommitInfo, CommitRequest, CommitResponse,
-    CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest, ForkRequest,
-    Frontend, GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey, ImportRequest,
-    LEASE_PROTOCOL, LEASE_RETURN, LEASE_RETURNED, MergeRequest, MergeResponse, MountInfo,
-    PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse, RestoreRequest,
-    RestoreResponse, Revision, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo,
-    WorkspaceInfo,
+    AdvanceRequest, BranchInfo, CacheInfo, Caller, ChangeInfo, CommitInfo, CommitRequest,
+    CommitResponse, CreateWorkspaceRequest, DirEntry, ErrorBody, ExportRequest, FetchRequest,
+    ForkRequest, Frontend, GcRequest, GcResponse, HaveRequest, HaveResponse, HostKey,
+    ImportRequest, LEASE_PROTOCOL, LEASE_RETURN, LEASE_RETURNED, MergeRequest, MergeResponse,
+    MountInfo, PullRequest, PullResponse, PushRequest, PushResponse, ReceiveResponse,
+    RestoreRequest, RestoreResponse, Revision, SaveCacheRequest, SnapshotRequest, SnapshotResponse,
+    SpaceInfo, TrackingInfo, WorkspaceInfo,
 };
 
 /// A connection-per-request client of a `peerfs` server.
@@ -540,12 +540,80 @@ impl Client {
         name: &str,
         branch: &str,
     ) -> Result<WorkspaceInfo, ClientError> {
+        self.create_workspace_with_cache(name, branch, None).await
+    }
+
+    /// Creates a workspace following `branch`, holding the current version of the build
+    /// cache `cache` when one is named and it exists.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `conflict` if the workspace exists, `not_found` if the branch does not,
+    /// `invalid` for a malformed cache name.
+    pub async fn create_workspace_with_cache(
+        &self,
+        name: &str,
+        branch: &str,
+        cache: Option<&str>,
+    ) -> Result<WorkspaceInfo, ClientError> {
         let request = CreateWorkspaceRequest {
             name: name.to_owned(),
             branch: branch.to_owned(),
+            cache: cache.map(ToOwned::to_owned),
         };
         self.json(Method::POST, "/v1/workspaces", Some(&request))
             .await
+    }
+
+    /// Every build cache, as its current version describes it.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server cannot be reached or answers with an error; `not_found` from a
+    /// server without caches.
+    pub async fn caches(&self) -> Result<Vec<CacheInfo>, ClientError> {
+        self.json(Method::GET, "/v1/caches", None::<&()>).await
+    }
+
+    /// Whether the server keeps build caches: whether it answers `GET /v1/caches`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server cannot be reached or answers with an error other than
+    /// `not_found`.
+    pub async fn has_caches(&self) -> Result<bool, ClientError> {
+        match self.caches().await {
+            Ok(_) => Ok(true),
+            Err(ClientError::Api { status: 404, .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Saves the derived files `workspace` shows as the new current version of the build
+    /// cache `name`, then discards the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `conflict` if the workspace has uncommitted source changes, is lent or is
+    /// mounted, `not_found` if it does not exist, `invalid` for a malformed cache name.
+    pub async fn save_cache(&self, name: &str, workspace: &str) -> Result<CacheInfo, ClientError> {
+        let path = format!("/v1/caches/{}", segment(name));
+        let request = SaveCacheRequest {
+            workspace: workspace.to_owned(),
+        };
+        self.json(Method::POST, &path, Some(&request)).await
+    }
+
+    /// Removes the build cache `name`. Versions workspaces hold stay until they end.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `not_found` if there is no such cache.
+    pub async fn remove_cache(&self, name: &str) -> Result<(), ClientError> {
+        let path = format!("/v1/caches/{}", segment(name));
+        self.call(Method::DELETE, &path, None, Bytes::new())
+            .await
+            .map(drop)
     }
 
     /// One workspace.
