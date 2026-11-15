@@ -47,8 +47,11 @@ impl fmt::Display for Class {
 }
 
 /// Dependency and build directories, tool caches, and transient files.
+/// `.peerspan/cache/`, at the workspace's root, holds the package caches a Peerspan runtime
+/// points the build's tools at, so they are saved with a build cache.
 pub const DEFAULT_DERIVED: &[&str] = &[
     ".git/",
+    ".peerspan/cache/",
     "node_modules/",
     "target/",
     ".venv/",
@@ -366,6 +369,13 @@ mod tests {
             ("deploy/id_ed25519.pub", EntryKind::File, Class::Source),
             ("infra/prod.tfvars", EntryKind::File, Class::Secret),
             ("build.rs", EntryKind::File, Class::Source),
+            (
+                ".peerspan/cache/cargo/registry/x.crate",
+                EntryKind::File,
+                Class::Derived,
+            ),
+            (".peerspan/config.toml", EntryKind::File, Class::Source),
+            ("sub/.peerspan/cache/x", EntryKind::File, Class::Source),
         ] {
             assert_eq!(classify(&none, &[], text, kind), class, "{text}");
         }
