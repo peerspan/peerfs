@@ -25,8 +25,10 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+pub(crate) mod cache;
 mod gc;
 
+pub use cache::{CacheInfo, check_cache_name};
 pub use gc::{GcOptions, GcReport};
 
 /// The first line of a space's `FORMAT` file.
@@ -1309,7 +1311,7 @@ impl Space {
             return Err(Error::WorkspaceExists(workspace.to_owned()));
         }
         let generation = self.generation(&name);
-        Workspace::create(dir, name, branch_name(branch)?, head, generation)
+        Workspace::create(dir, name, branch_name(branch)?, head, generation, None)
     }
 
     /// Opens an existing workspace.

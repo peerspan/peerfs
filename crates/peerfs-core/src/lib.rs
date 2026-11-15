@@ -54,9 +54,12 @@ pub use sign::{
     SIGNING_CONTEXT, Signature, Signer,
 };
 pub use space::{
-    CommitOutcome, DEFAULT_BRANCH, GcOptions, GcReport, MergeOutcome, Merged, Restored, Space,
+    CacheInfo, CommitOutcome, DEFAULT_BRANCH, GcOptions, GcReport, MergeOutcome, Merged, Restored,
+    Space, check_cache_name,
 };
 pub use sync::{
     FETCH_BATCH, Pull, Pulled, Push, RawObject, Remote, Tracking, decode_objects, encode_objects,
 };
-pub use workspace::{Change, EntryKind, Located, NewEntry, Workspace};
+pub use workspace::{
+    Change, EntryKind, HeldCache, Located, NewEntry, Workspace, held_cache_version,
+};

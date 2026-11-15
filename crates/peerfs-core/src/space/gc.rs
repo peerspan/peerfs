@@ -6,7 +6,8 @@
 //! [`GcOptions::reachable`], and any snapshot younger than [`GcOptions::unreachable`]. A
 //! kept snapshot keeps the older ones it follows, so the store stays closed. Packs written
 //! within [`GcOptions::grace`] are not touched, so objects of a pull or push that has not
-//! yet moved a reference survive.
+//! yet moved a reference survive. Build cache versions no cache names as current and no
+//! workspace holds are dropped too.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
@@ -68,6 +69,9 @@ pub struct GcReport {
     pub snapshots_kept: usize,
     /// Snapshots dropped.
     pub snapshots_dropped: usize,
+    /// Build cache versions dropped: those no cache names as current and no workspace
+    /// holds.
+    pub cache_versions_dropped: usize,
 }
 
 impl Space {
@@ -104,6 +108,11 @@ impl Space {
             Sweep::Apply
         };
         let compacted = self.store.compact(&live, since(options.grace), sweep)?;
+        let cache_versions_dropped = if options.dry_run {
+            self.count_unheld_versions()?
+        } else {
+            self.drop_unheld_versions()?
+        };
         // Decoded trees of dropped objects would otherwise linger.
         self.trees.borrow_mut().clear();
         let dropped = |id: &ObjectId| compacted.dropped.contains(id);
@@ -115,6 +124,7 @@ impl Space {
             packs_rewritten: compacted.packs,
             snapshots_kept: snapshots.iter().filter(|(id, _)| live.contains(id)).count(),
             snapshots_dropped: snapshots.iter().filter(|(id, _)| dropped(id)).count(),
+            cache_versions_dropped,
         })
     }
 

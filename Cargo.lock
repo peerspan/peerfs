@@ -950,6 +950,7 @@ dependencies = [
  "fastcdc",
  "getrandom 0.4.3",
  "ignore",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
