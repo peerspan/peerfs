@@ -190,6 +190,16 @@ pub enum Error {
          merge; restoring an earlier snapshot would undo that, so resolve and commit first"
     )]
     BaseMoved(String),
+    /// A build cache name is not 1 to 128 lowercase ASCII letters, digits, `.`, `_` and
+    /// `-` starting with a letter or digit.
+    #[error(
+        "invalid cache name {0:?}: 1 to 128 lowercase letters, digits, `.`, `_` and `-`, \
+         starting with a letter or digit"
+    )]
+    InvalidCacheName(String),
+    /// No build cache has this name.
+    #[error("no cache {0}")]
+    NoSuchCache(String),
 }
 
 impl Error {

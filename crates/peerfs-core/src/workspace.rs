@@ -1,13 +1,15 @@
 //! Workspaces: a writable overlay on the local host over a commit of a branch.
 //!
 //! A workspace keeps the files written in it under `upper/`, whole, and the paths removed
-//! from its base in `whiteouts`. Reading looks at the overlay first, then the base commit.
-//! Every write is synced before it returns.
+//! from its base in `whiteouts`. Reading looks at the overlay first, then the base commit,
+//! then the build cache version the workspace holds, if any: that layer shows only at
+//! derived paths, is read-only, and keeps its own removals in `cache-whiteouts`. Every
+//! write is synced before it returns.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, FileTimes};
+use std::io::{Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::id::ObjectId;
 use crate::object::{ChangeId, Content, Entry, FileMode, Name, Tree};
 use crate::path::TreePath;
+use crate::space::cache::{DATES, FILES, copy_tree, version_dir};
 use crate::space::{Space, mode_of, permissions};
 use crate::store::sync_dir;
 
@@ -51,6 +54,39 @@ pub enum Located {
     Local(PathBuf),
     /// Only in the base commit.
     Base(Entry),
+    /// Only in the build cache version the workspace holds: a real file, link or directory
+    /// at this local path, which must never be written. A directory here may also have
+    /// entries from the overlay and the base.
+    Cached(PathBuf),
+}
+
+/// The build cache version a workspace holds, which it shows read-only under its derived
+/// paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldCache {
+    /// The cache.
+    pub name: String,
+    /// The version, which never changes once saved.
+    pub version: String,
+    /// The commit whose tree the version's files were built from.
+    pub commit: ObjectId,
+}
+
+/// Which layers a read looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layers {
+    /// The overlay, the base and the held cache version.
+    All,
+    /// The overlay and the base only.
+    AboveCache,
+}
+
+/// Whether the base's entry at a path, and with it the cache's, is hidden by a removal or by
+/// a file written over one of its directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseView {
+    Shown,
+    Hidden,
 }
 
 /// An entry to create in a workspace.
@@ -99,7 +135,19 @@ pub struct Workspace {
     /// The overlay count as of this value's last change or check.
     seen_overlay: u64,
     /// When each base entry was first seen at its path, loaded on first use.
-    stamps: Option<HashMap<TreePath, (u64, SystemTime)>>,
+    stamps: Option<Stamps>,
+    /// When the workspace was created, and at which base; absent for workspaces created
+    /// before it was recorded.
+    created: Option<(SystemTime, ObjectId)>,
+    /// The build cache version it holds.
+    cache: Option<HeldCache>,
+    /// The held version's paths removed, which stay hidden.
+    cache_whiteouts: BTreeSet<TreePath>,
+    /// The held version's `dates`, loaded on first use.
+    dates: Option<Stamps>,
+    /// Classes of paths the cache layer was asked about, by path and whether it is a
+    /// directory. Forgotten when a `.gitignore` changes.
+    classes: RefCell<HashMap<(TreePath, bool), Class>>,
 }
 
 /// Counts a workspace's changes, shared by every value of it that a space opened. The
@@ -123,10 +171,17 @@ pub(crate) type Generation = Arc<Counts>;
 
 const STATE: &str = "state";
 const WHITEOUTS: &str = "whiteouts";
+const CACHE_WHITEOUTS: &str = "cache-whiteouts";
 const STAMPS: &str = "stamps";
 
+/// The file whose changes change which paths are derived.
+const GITIGNORE: &str = ".gitignore";
+
+/// The buffer a cached file is copied up through.
+const COPY_BUFFER: usize = 1024 * 1024;
+
 /// A stable digest of a base entry, for telling whether a path's content changed.
-fn entry_key(entry: &Entry) -> u64 {
+pub(crate) fn entry_key(entry: &Entry) -> u64 {
     let mut hasher = blake3::Hasher::new_derive_key("peerfs 2026-10-27 stamp key");
     match entry {
         Entry::File { content, mode } => {
@@ -156,19 +211,158 @@ fn entry_key(entry: &Entry) -> u64 {
     u64::from_le_bytes(key)
 }
 
-/// One line of the stamp log.
-fn stamp_line(path: &TreePath, key: u64, at: SystemTime) -> String {
-    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
-    format!(
-        "{}.{:09} {key:016x} {path}\n",
-        since.as_secs(),
-        since.subsec_nanos()
-    )
+/// One line of the stamp log, and of a cache version's `dates`.
+pub(crate) fn stamp_line(path: &TreePath, key: u64, at: SystemTime) -> String {
+    format!("{} {key:016x} {path}\n", time_text(at))
 }
 
-fn parse_time(text: &str) -> Option<SystemTime> {
+/// Dates of base entries by path, each with its entry's key.
+type Stamps = HashMap<TreePath, (u64, SystemTime)>;
+
+/// A line of the stamp log as path, key and date, or `None` if it is malformed.
+fn parse_stamp_line(line: &str) -> Option<(TreePath, u64, SystemTime)> {
+    let mut fields = line.splitn(3, ' ');
+    let (at, key, path) = (fields.next()?, fields.next()?, fields.next()?);
+    Some((
+        TreePath::try_from(path).ok()?,
+        u64::from_str_radix(key, 16).ok()?,
+        parse_time(at)?,
+    ))
+}
+
+/// Reads stamp lines, the last line for a path winning, and how many lines there were. A
+/// missing file has none.
+fn read_stamps(path: &Path) -> Result<(Stamps, usize)> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((HashMap::new(), 0)),
+        Err(e) => return Err(Error::io("reading", path, e)),
+    };
+    let mut stamps = HashMap::new();
+    let mut lines = 0_usize;
+    for line in text.lines() {
+        lines += 1;
+        if let Some((at_path, key, at)) = parse_stamp_line(line) {
+            stamps.insert(at_path, (key, at));
+        }
+    }
+    Ok((stamps, lines))
+}
+
+/// A time as `seconds.nanoseconds` since the Unix epoch.
+pub(crate) fn time_text(at: SystemTime) -> String {
+    let since = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    format!("{}.{:09}", since.as_secs(), since.subsec_nanos())
+}
+
+pub(crate) fn parse_time(text: &str) -> Option<SystemTime> {
     let (secs, nanos) = text.split_once('.')?;
     Some(UNIX_EPOCH + Duration::new(secs.parse().ok()?, nanos.parse().ok()?))
+}
+
+/// The `cache NAME VERSION COMMIT` line of a workspace's state.
+fn parse_held(text: &str) -> Option<HeldCache> {
+    let mut fields = text.split(' ');
+    let (name, version, commit) = (fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(HeldCache {
+        name: name.to_owned(),
+        version: version.to_owned(),
+        commit: commit.parse().ok()?,
+    })
+}
+
+/// The `created SECONDS.NANOS BASE` line of a workspace's state.
+fn parse_created(text: &str) -> Option<(SystemTime, ObjectId)> {
+    let (at, base) = text.split_once(' ')?;
+    Some((parse_time(at)?, base.parse().ok()?))
+}
+
+/// The cache version the workspace `workspace` of the space in `space_dir` holds, read from
+/// its state without opening the space, as a confined process needs it: its directory in
+/// the space, relative to the space's directory.
+///
+/// # Errors
+///
+/// Fails if the workspace's state cannot be read or names a malformed version.
+pub fn held_cache_version(space_dir: &Path, workspace: &str) -> Result<Option<PathBuf>> {
+    let name = Name::try_from(workspace)?;
+    let state_path = space_dir.join("workspaces").join(name.as_str()).join(STATE);
+    let state =
+        fs::read_to_string(&state_path).map_err(|e| Error::io("reading", &state_path, e))?;
+    for line in state.lines() {
+        if let Some(text) = line.strip_prefix("cache ") {
+            let held = parse_held(text)
+                .ok_or_else(|| Error::Corrupt(format!("workspace {workspace}: bad cache")))?;
+            return Ok(Some(version_dir(Path::new(""), &held.version)?));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `path` names a `.gitignore`, whose changes can change which paths are derived.
+fn is_gitignore(path: &TreePath) -> bool {
+    path.split_last()
+        .is_some_and(|(_, name)| name.as_str() == GITIGNORE)
+}
+
+/// What kind of entry a file type is.
+fn kind_of(file_type: fs::FileType) -> EntryKind {
+    if file_type.is_dir() {
+        EntryKind::Directory
+    } else if file_type.is_symlink() {
+        EntryKind::Symlink
+    } else {
+        EntryKind::File
+    }
+}
+
+/// Whether `path` is a directory itself, not a link to one.
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// Copies the cached entry at `from` into the overlay at `to`: a file with its mode and
+/// dates, a link, or an empty directory with its mode. Read and written in plain calls, so
+/// a confined process can copy too.
+fn copy_cached(from: &Path, to: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(from).map_err(|e| Error::io("reading", from, e))?;
+    let mode = fs::Permissions::from_mode(meta.permissions().mode() & 0o7777);
+    if meta.is_dir() {
+        make_dirs(to)?;
+        return fs::set_permissions(to, mode).map_err(|e| Error::io("copying up", to, e));
+    }
+    if meta.is_symlink() {
+        let target = fs::read_link(from).map_err(|e| Error::io("reading", from, e))?;
+        return symlink(target, to).map_err(|e| Error::io("copying up", to, e));
+    }
+    let mut source = File::open(from).map_err(|e| Error::io("reading", from, e))?;
+    let mut target = File::create_new(to).map_err(|e| Error::io("copying up", to, e))?;
+    let mut buffer = vec![0; COPY_BUFFER];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|e| Error::io("reading", from, e))?;
+        if read == 0 {
+            break;
+        }
+        target
+            .write_all(&buffer[..read])
+            .map_err(|e| Error::io("copying up", to, e))?;
+    }
+    let mut times = FileTimes::new();
+    if let Ok(modified) = meta.modified() {
+        times = times.set_modified(modified);
+    }
+    if let Ok(accessed) = meta.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    target
+        .set_permissions(mode)
+        .and_then(|()| target.set_times(times))
+        .map_err(|e| Error::io("copying up", to, e))
 }
 
 fn upper(dir: &Path) -> PathBuf {
@@ -182,6 +376,7 @@ impl Workspace {
         branch: Name,
         base: ObjectId,
         generation: Generation,
+        cache: Option<HeldCache>,
     ) -> Result<Self> {
         fs::create_dir_all(upper(&dir)).map_err(|e| Error::io("creating", &dir, e))?;
         let workspace = Self {
@@ -198,6 +393,11 @@ impl Workspace {
             seen_overlay: generation.overlay.load(Ordering::Acquire),
             generation,
             stamps: None,
+            created: Some((SystemTime::now(), base)),
+            cache,
+            cache_whiteouts: BTreeSet::new(),
+            dates: None,
+            classes: RefCell::new(HashMap::new()),
         };
         let mut workspace = workspace;
         workspace.save()?;
@@ -241,23 +441,16 @@ impl Workspace {
             Some(text) => Some(text.parse().map_err(|_| corrupt("merge"))?),
             None => None,
         };
-        let whiteouts_path = dir.join(WHITEOUTS);
-        let mut whiteouts = BTreeSet::new();
-        match fs::read_to_string(&whiteouts_path) {
-            // A log: `+path` adds a whiteout, `-path` drops one, a bare path adds one.
-            Ok(text) => {
-                for line in text.lines() {
-                    if let Some(dropped) = line.strip_prefix('-') {
-                        whiteouts.remove(&TreePath::try_from(dropped)?);
-                    } else {
-                        let added = line.strip_prefix('+').unwrap_or(line);
-                        whiteouts.insert(TreePath::try_from(added)?);
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::io("reading", whiteouts_path, e)),
-        }
+        let created = match fields.get("created") {
+            Some(text) => Some(parse_created(text).ok_or_else(|| corrupt("creation"))?),
+            None => None,
+        };
+        let cache = match fields.get("cache") {
+            Some(text) => Some(parse_held(text).ok_or_else(|| corrupt("cache"))?),
+            None => None,
+        };
+        let whiteouts = read_whiteouts(&dir.join(WHITEOUTS))?;
+        let cache_whiteouts = read_whiteouts(&dir.join(CACHE_WHITEOUTS))?;
         Ok(Self {
             dir,
             name,
@@ -272,7 +465,30 @@ impl Workspace {
             seen,
             seen_overlay,
             stamps: None,
+            created,
+            cache,
+            cache_whiteouts,
+            dates: None,
+            classes: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// The build cache version this workspace holds, if any.
+    pub fn cache(&self) -> Option<&HeldCache> {
+        self.cache.as_ref()
+    }
+
+    /// The held version's directory, if the workspace holds one.
+    fn version_dir(&self) -> Option<PathBuf> {
+        let held = self.cache.as_ref()?;
+        let space_dir = self.dir.parent()?.parent()?;
+        version_dir(space_dir, &held.version).ok()
+    }
+
+    /// Forgets the classes the cache layer worked out, as when a `.gitignore` changed. The
+    /// owner's `classes` file is read again too.
+    pub fn forget_classes(&self) {
+        self.classes.borrow_mut().clear();
     }
 
     /// Whether this value still matches the workspace on disk: no other value of it from
@@ -293,24 +509,51 @@ impl Workspace {
         changed
     }
 
-    /// When the base entry `entry` at `path` is dated: when this workspace first saw that
-    /// content there, or when a commit took it from the overlay with that mtime. Kept in
-    /// the workspace, so the date survives commits and remounts and changes only with the
-    /// content.
+    /// When the base entry `entry` at `path` is dated. With a held cache version whose
+    /// commit has the same entry at `path`, as that version's `dates` have it, so an
+    /// unchanged source is older than the output built from it. Otherwise when this
+    /// workspace first saw that content there (when it was created, while its base is still
+    /// the one it was created at), or when a commit took it from the overlay with that
+    /// mtime. Kept in the workspace, so the date survives commits and remounts and changes
+    /// only with the content.
     ///
     /// # Errors
     ///
-    /// Fails if the workspace's stamps cannot be read or written.
+    /// Fails if the workspace's stamps or its cache version's dates cannot be read, or the
+    /// stamps cannot be written.
     pub fn stamp(&mut self, path: &TreePath, entry: &Entry) -> Result<SystemTime> {
         let key = entry_key(entry);
+        if let Some(at) = self.cache_date(path, key)? {
+            return Ok(at);
+        }
         if let Some((known, at)) = self.stamps()?.get(path)
             && *known == key
         {
             return Ok(*at);
         }
-        let now = SystemTime::now();
-        self.record_stamp(path, key, now)?;
-        Ok(now)
+        let at = match self.created {
+            Some((created, base)) if base == self.base => created,
+            _ => SystemTime::now(),
+        };
+        self.record_stamp(path, key, at)?;
+        Ok(at)
+    }
+
+    /// The date the held version's `dates` give the entry with `key` at `path`, if its
+    /// commit had that entry there.
+    fn cache_date(&mut self, path: &TreePath, key: u64) -> Result<Option<SystemTime>> {
+        if self.dates.is_none() {
+            let Some(dir) = self.version_dir() else {
+                return Ok(None);
+            };
+            self.dates = Some(read_stamps(&dir.join(DATES))?.0);
+        }
+        Ok(self
+            .dates
+            .as_ref()
+            .and_then(|dates| dates.get(path))
+            .filter(|(known, _)| *known == key)
+            .map(|(_, at)| *at))
     }
 
     /// Dates the base entry `entry` at `path` to `at`.
@@ -324,7 +567,7 @@ impl Workspace {
         self.record_stamp(path, entry_key(entry), at)
     }
 
-    fn stamps(&mut self) -> Result<&mut HashMap<TreePath, (u64, SystemTime)>> {
+    fn stamps(&mut self) -> Result<&mut Stamps> {
         if self.stamps.is_none() {
             self.stamps = Some(self.load_stamps()?);
         }
@@ -333,32 +576,8 @@ impl Workspace {
 
     /// Reads the stamp log, `seconds.nanoseconds key path` per line, the last line for a
     /// path winning; rewrites it when it has grown well past the stamps it holds.
-    fn load_stamps(&self) -> Result<HashMap<TreePath, (u64, SystemTime)>> {
-        let path = self.dir.join(STAMPS);
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
-            Err(e) => return Err(Error::io("reading", &path, e)),
-        };
-        let mut stamps = HashMap::new();
-        let mut lines = 0_usize;
-        for line in text.lines() {
-            lines += 1;
-            let mut fields = line.splitn(3, ' ');
-            let (Some(at), Some(key), Some(at_path)) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                continue;
-            };
-            let (Some(at), Ok(key), Ok(at_path)) = (
-                parse_time(at),
-                u64::from_str_radix(key, 16),
-                TreePath::try_from(at_path),
-            ) else {
-                continue;
-            };
-            stamps.insert(at_path, (key, at));
-        }
+    fn load_stamps(&self) -> Result<Stamps> {
+        let (stamps, lines) = read_stamps(&self.dir.join(STAMPS))?;
         if lines > 2 * stamps.len() + 1024 {
             let mut compact = String::new();
             for (at_path, (key, at)) in &stamps {
@@ -477,8 +696,17 @@ impl Workspace {
             .merging
             .map(|merging| format!("merge {merging}\n"))
             .unwrap_or_default();
+        let created = self
+            .created
+            .map(|(at, base)| format!("created {} {base}\n", time_text(at)))
+            .unwrap_or_default();
+        let cache = self
+            .cache
+            .as_ref()
+            .map(|held| format!("cache {} {} {}\n", held.name, held.version, held.commit))
+            .unwrap_or_default();
         let state = format!(
-            "branch {}\nbase {}\nchange {}\n{snapshot}{merge}",
+            "branch {}\nbase {}\nchange {}\n{snapshot}{merge}{created}{cache}",
             self.branch, self.base, self.change
         );
         write_synced(&self.dir, STATE, state.as_bytes())?;
@@ -530,13 +758,27 @@ impl Workspace {
     }
 
     fn log_whiteout(&mut self, op: char, path: &TreePath) -> Result<()> {
-        let log = self.dir.join(WHITEOUTS);
+        self.append_log(WHITEOUTS, &format!("{op}{path}\n"))
+    }
+
+    /// Records the removal of the held version's entry at `path`, durably. It is never
+    /// forgotten: what the workspace writes there later is in its overlay, and the version
+    /// never changes.
+    fn add_cache_whiteout(&mut self, path: &TreePath) -> Result<()> {
+        if self.cache_whiteouts.insert(path.clone()) {
+            self.append_log(CACHE_WHITEOUTS, &format!("+{path}\n"))?;
+        }
+        Ok(())
+    }
+
+    fn append_log(&mut self, name: &str, line: &str) -> Result<()> {
+        let log = self.dir.join(name);
         fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log)
             .and_then(|mut file| {
-                file.write_all(format!("{op}{path}\n").as_bytes())?;
+                file.write_all(line.as_bytes())?;
                 file.sync_data()
             })
             .map_err(|e| Error::io("writing", &log, e))?;
@@ -577,11 +819,141 @@ impl Workspace {
         false
     }
 
-    fn base_entry(&self, space: &Space, path: &TreePath) -> Result<Option<Entry>> {
+    fn base_view(&self, path: &TreePath) -> BaseView {
         if self.hidden(path) {
+            BaseView::Hidden
+        } else {
+            BaseView::Shown
+        }
+    }
+
+    fn base_entry(&self, space: &Space, path: &TreePath) -> Result<Option<Entry>> {
+        self.base_entry_in(space, path, self.base_view(path))
+    }
+
+    fn base_entry_in(
+        &self,
+        space: &Space,
+        path: &TreePath,
+        view: BaseView,
+    ) -> Result<Option<Entry>> {
+        if view == BaseView::Hidden {
             return Ok(None);
         }
         space.entry(self.base_tree(space)?, path)
+    }
+
+    /// Whether the held version's entry at `path`, or one of its directories, was removed.
+    fn cache_hidden(&self, path: &TreePath) -> bool {
+        if self.cache_whiteouts.is_empty() {
+            return false;
+        }
+        let mut prefix = TreePath::root();
+        path.components().iter().any(|name| {
+            prefix = prefix.join(name);
+            self.cache_whiteouts.contains(&prefix)
+        })
+    }
+
+    /// Where the held version keeps the entry at `path`, if the workspace holds one.
+    fn cache_local(&self, path: &TreePath) -> Option<PathBuf> {
+        let mut full = self.version_dir()?.join(FILES);
+        for name in path.components() {
+            full.push(name.as_str());
+        }
+        Some(full)
+    }
+
+    /// The held version's entry at `path`, when the workspace would show it there with no
+    /// overlay entry at `path` itself: the base has nothing there, nothing removed it or its
+    /// directories, and it is derived. `view` says whether the base is hidden at `path`.
+    ///
+    /// Callers check the overlay at `path` first; one that removes or moves an overlay entry
+    /// uses this to learn whether a cached entry would show once it is gone.
+    fn cached(&self, space: &Space, path: &TreePath, view: BaseView) -> Result<Option<PathBuf>> {
+        if view == BaseView::Hidden || path.is_root() || self.cache_hidden(path) {
+            return Ok(None);
+        }
+        let Some(local) = self.cache_local(path) else {
+            return Ok(None);
+        };
+        let Ok(meta) = fs::symlink_metadata(&local) else {
+            return Ok(None);
+        };
+        if self.cache_shows(space, path, kind_of(meta.file_type()))? {
+            Ok(Some(local))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Whether the cache layer shows its entry of `kind` at `path`, which it holds: every
+    /// directory on the way is a real directory in the version (never a link out of it) and
+    /// a directory, or nothing, in the base; the base has nothing at `path`; and `path` is
+    /// derived, or a source directory, which shows only that it leads to derived files. So
+    /// a source or secret path never shows a cache file, and the cache never hides the base.
+    fn cache_shows(&self, space: &Space, path: &TreePath, kind: EntryKind) -> Result<bool> {
+        let Some(mut version) = self.cache_local(&TreePath::root()) else {
+            return Ok(false);
+        };
+        let names = path.components();
+        let mut base = Some(Entry::Tree(self.base_tree(space)?));
+        for (index, name) in names.iter().enumerate() {
+            base = match base {
+                Some(Entry::Tree(id)) => space.shared_tree(id)?.get(name).cloned(),
+                _ => None,
+            };
+            if index + 1 == names.len() {
+                if base.is_some() {
+                    return Ok(false);
+                }
+                break;
+            }
+            version.push(name.as_str());
+            if !is_real_dir(&version)
+                || matches!(base, Some(Entry::File { .. } | Entry::Symlink(_)))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(match self.class_of(space, path, kind)? {
+            Class::Derived => true,
+            Class::Source => kind == EntryKind::Directory,
+            Class::Secret => false,
+        })
+    }
+
+    /// The class of `path`, an entry of `kind`, given its directories' classes, which are
+    /// worked out too. Remembered until [`Workspace::forget_classes`].
+    fn class_of(&self, space: &Space, path: &TreePath, kind: EntryKind) -> Result<Class> {
+        let names = path.components();
+        let mut rules = None;
+        let mut prefix = TreePath::root();
+        for (index, name) in names.iter().enumerate() {
+            prefix = prefix.join(name);
+            let kind = if index + 1 == names.len() {
+                kind
+            } else {
+                EntryKind::Directory
+            };
+            let key = (prefix.clone(), kind == EntryKind::Directory);
+            let known = self.classes.borrow().get(&key).copied();
+            let class = if let Some(class) = known {
+                class
+            } else {
+                let rules = match &mut rules {
+                    Some(rules) => rules,
+                    None => rules.insert(self.classifier(space)?),
+                };
+                let class = rules.classify_child(&prefix, kind);
+                self.classes.borrow_mut().insert(key, class);
+                class
+            };
+            if class != Class::Source {
+                return Ok(class);
+            }
+        }
+        Ok(Class::Source)
     }
 
     /// Reads the file at `path`.
@@ -590,27 +962,54 @@ impl Workspace {
     ///
     /// Fails if nothing is there, it is not a regular file, or on a store error.
     pub fn read(&self, space: &Space, path: &str) -> Result<Vec<u8>> {
-        let tree_path = TreePath::try_from(path)?;
-        let local = self.upper_path(&tree_path);
-        if let Ok(meta) = fs::symlink_metadata(&local) {
-            if meta.is_file() {
+        self.read_in(space, &TreePath::try_from(path)?, Layers::All)
+    }
+
+    fn read_in(&self, space: &Space, tree_path: &TreePath, layers: Layers) -> Result<Vec<u8>> {
+        let local = self.upper_path(tree_path);
+        let in_overlay = match fs::symlink_metadata(&local) {
+            Ok(meta) if meta.is_file() => {
                 return fs::read(&local).map_err(|e| Error::io("reading", local, e));
             }
-            if !meta.is_dir() {
+            Ok(meta) if !meta.is_dir() => {
                 return Err(Error::WrongEntry {
                     path: tree_path.to_string(),
                     found: "symlink",
                 });
             }
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        let view = self.base_view(tree_path);
+        match self.base_entry_in(space, tree_path, view)? {
+            Some(Entry::File { content, .. }) => return space.read_content(&content),
+            Some(other) => {
+                return Err(Error::WrongEntry {
+                    path: tree_path.to_string(),
+                    found: other.describe(),
+                });
+            }
+            None => {}
         }
-        match self.base_entry(space, &tree_path)? {
-            Some(Entry::File { content, .. }) => space.read_content(&content),
-            Some(other) => Err(Error::WrongEntry {
+        if layers == Layers::All
+            && !in_overlay
+            && let Some(cached) = self.cached(space, tree_path, view)?
+        {
+            let meta =
+                fs::symlink_metadata(&cached).map_err(|e| Error::io("reading", &cached, e))?;
+            if meta.is_file() {
+                return fs::read(&cached).map_err(|e| Error::io("reading", cached, e));
+            }
+            return Err(Error::WrongEntry {
                 path: tree_path.to_string(),
-                found: other.describe(),
-            }),
-            None => Err(Error::NotFound(tree_path.to_string())),
+                found: if meta.is_dir() {
+                    "directory"
+                } else {
+                    "symlink"
+                },
+            });
         }
+        Err(Error::NotFound(tree_path.to_string()))
     }
 
     /// Writes `bytes` to the file at `path`, creating its directories. A file that was
@@ -630,13 +1029,26 @@ impl Workspace {
         self.changed_overlay();
         let parent = self.upper_path(&parent_path);
         let local = self.upper_path(&tree_path);
-        let mode = match fs::symlink_metadata(&local) {
-            Ok(meta) if meta.is_file() => mode_of(meta.permissions().mode()),
-            _ => match self.base_entry(space, &tree_path)? {
-                Some(Entry::File { mode, .. }) => mode,
-                _ => FileMode::Regular,
-            },
+        let file_mode = |path: &Path| match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_file() => Some(mode_of(meta.permissions().mode())),
+            _ => None,
         };
+        let mode = if let Some(mode) = file_mode(&local) {
+            mode
+        } else {
+            let view = self.base_view(&tree_path);
+            match self.base_entry_in(space, &tree_path, view)? {
+                Some(Entry::File { mode, .. }) => mode,
+                Some(_) => FileMode::Regular,
+                None => self
+                    .cached(space, &tree_path, view)?
+                    .and_then(|cached| file_mode(&cached))
+                    .unwrap_or(FileMode::Regular),
+            }
+        };
+        if is_gitignore(&tree_path) {
+            self.forget_classes();
+        }
         if let Ok(meta) = fs::symlink_metadata(&local) {
             remove_local(&local, &meta)?;
         }
@@ -670,11 +1082,16 @@ impl Workspace {
         if fs::symlink_metadata(&local).is_ok() {
             return Ok(Some(Located::Local(local)));
         }
-        Ok(self.base_entry(space, path)?.map(Located::Base))
+        let view = self.base_view(path);
+        if let Some(entry) = self.base_entry_in(space, path, view)? {
+            return Ok(Some(Located::Base(entry)));
+        }
+        Ok(self.cached(space, path, view)?.map(Located::Cached))
     }
 
-    /// Brings the entry at `path` into the overlay, if it is only in the base, and returns
-    /// its local path. A directory is created empty; its base entries stay visible.
+    /// Brings the entry at `path` into the overlay, if it is only in the base or the held
+    /// cache version, and returns its local path. A directory is created empty; its base and
+    /// cached entries stay visible. A cached file keeps its mode and dates.
     ///
     /// The copy is not synced: like any write through a mount, it is durable once synced.
     ///
@@ -683,12 +1100,22 @@ impl Workspace {
     /// Fails if nothing is there, or on a store or file system error.
     pub fn copy_up(&mut self, space: &Space, path: &TreePath) -> Result<PathBuf> {
         let local = self.upper_path(path);
-        if fs::symlink_metadata(&local).is_ok() {
-            return Ok(local);
-        }
-        let entry = self
-            .base_entry(space, path)?
-            .ok_or_else(|| Error::NotFound(path.to_string()))?;
+        let entry = match self.locate(space, path)? {
+            Some(Located::Local(local)) => return Ok(local),
+            Some(Located::Base(entry)) => entry,
+            Some(Located::Cached(cached)) => {
+                self.changed_overlay();
+                if let Some((parent, _)) = path.split_last() {
+                    make_dirs(&self.upper_path(&parent))?;
+                }
+                copy_cached(&cached, &local)?;
+                if is_gitignore(path) {
+                    self.forget_classes();
+                }
+                return Ok(local);
+            }
+            None => return Err(Error::NotFound(path.to_string())),
+        };
         self.changed_overlay();
         if let Some((parent, _)) = path.split_last() {
             make_dirs(&self.upper_path(&parent))?;
@@ -730,6 +1157,9 @@ impl Workspace {
         }
         match self.locate(space, &parent)? {
             Some(Located::Base(Entry::Tree(_))) => make_dirs(&self.upper_path(&parent))?,
+            Some(Located::Cached(cached)) if is_real_dir(&cached) => {
+                make_dirs(&self.upper_path(&parent))?;
+            }
             Some(Located::Local(local)) if local.is_dir() => {}
             Some(_) => {
                 return Err(Error::WrongEntry {
@@ -757,6 +1187,9 @@ impl Workspace {
         if !matches!(new, NewEntry::Directory) {
             self.replaced(space, path)?;
         }
+        if is_gitignore(path) {
+            self.forget_classes();
+        }
         Ok(local)
     }
 
@@ -775,7 +1208,7 @@ impl Workspace {
             return Err(Error::Exists(to.to_string()));
         };
         let source_is_dir = match self.locate(space, from)? {
-            Some(Located::Local(local)) => local.is_dir() && !local.is_symlink(),
+            Some(Located::Local(local) | Located::Cached(local)) => is_real_dir(&local),
             Some(Located::Base(entry)) => matches!(entry, Entry::Tree(_)),
             None => return Err(Error::NotFound(from.to_string())),
         };
@@ -790,6 +1223,9 @@ impl Workspace {
         }
         match self.locate(space, &to_parent)? {
             Some(Located::Base(Entry::Tree(_))) => make_dirs(&self.upper_path(&to_parent))?,
+            Some(Located::Cached(cached)) if is_real_dir(&cached) => {
+                make_dirs(&self.upper_path(&to_parent))?;
+            }
             Some(Located::Local(local)) if local.is_dir() => {}
             Some(_) => {
                 return Err(Error::WrongEntry {
@@ -804,6 +1240,9 @@ impl Workspace {
         self.changed_overlay();
         fs::hard_link(&local_from, &local_to).map_err(|e| Error::io("linking", &local_to, e))?;
         self.replaced(space, to)?;
+        if is_gitignore(to) {
+            self.forget_classes();
+        }
         Ok(local_to)
     }
 
@@ -834,12 +1273,15 @@ impl Workspace {
         let source = self
             .locate(space, from)?
             .ok_or_else(|| Error::NotFound(from.to_string()))?;
-        let from_in_base = self.base_entry(space, from)?.is_some();
+        let view = self.base_view(from);
+        let from_in_base = self.base_entry_in(space, from, view)?.is_some();
+        // Under the overlay's own entry too, which would show again once that moved.
+        let from_in_cache = !from_in_base && self.cached(space, from, view)?.is_some();
         let source_is_dir = match &source {
-            Located::Local(local) => local.is_dir() && !local.is_symlink(),
+            Located::Local(local) | Located::Cached(local) => is_real_dir(local),
             Located::Base(entry) => matches!(entry, Entry::Tree(_)),
         };
-        if source_is_dir && from_in_base {
+        if source_is_dir && (from_in_base || from_in_cache) {
             return Err(Error::DirectoryRename(from.to_string()));
         }
         let Some((to_parent, _)) = to.split_last() else {
@@ -847,7 +1289,7 @@ impl Workspace {
         };
         if let Some(existing) = self.locate(space, to)? {
             let existing_is_dir = match &existing {
-                Located::Local(local) => local.is_dir() && !local.is_symlink(),
+                Located::Local(local) | Located::Cached(local) => is_real_dir(local),
                 Located::Base(entry) => matches!(entry, Entry::Tree(_)),
             };
             match (source_is_dir, existing_is_dir) {
@@ -870,6 +1312,9 @@ impl Workspace {
         let local_from = self.copy_up(space, from)?;
         match self.locate(space, &to_parent)? {
             Some(Located::Base(Entry::Tree(_))) => make_dirs(&self.upper_path(&to_parent))?,
+            Some(Located::Cached(cached)) if is_real_dir(&cached) => {
+                make_dirs(&self.upper_path(&to_parent))?;
+            }
             Some(Located::Local(local)) if local.is_dir() => {}
             _ => return Err(Error::NotFound(to_parent.to_string())),
         }
@@ -879,8 +1324,14 @@ impl Workspace {
         if from_in_base {
             self.add_whiteout(from)?;
         }
+        if from_in_cache {
+            self.add_cache_whiteout(from)?;
+        }
         if !source_is_dir {
             self.replaced(space, to)?;
+        }
+        if is_gitignore(from) || is_gitignore(to) {
+            self.forget_classes();
         }
         Ok(())
     }
@@ -896,11 +1347,20 @@ impl Workspace {
             }
             Err(_) => false,
         };
-        let in_base = self.base_entry(space, &tree_path)?.is_some();
+        let view = self.base_view(&tree_path);
+        let in_base = self.base_entry_in(space, &tree_path, view)?.is_some();
         if in_base {
             self.add_whiteout(&tree_path)?;
         }
-        if !in_upper && !in_base {
+        // A base removal hides the cache's entry there too.
+        let in_cache = !in_base && self.cached(space, &tree_path, view)?.is_some();
+        if in_cache {
+            self.add_cache_whiteout(&tree_path)?;
+        }
+        if is_gitignore(&tree_path) {
+            self.forget_classes();
+        }
+        if !in_upper && !in_base && !in_cache {
             return Err(Error::NotFound(tree_path.to_string()));
         }
         Ok(())
@@ -915,7 +1375,8 @@ impl Workspace {
         let tree_path = TreePath::try_from(path)?;
         let mut entries = BTreeMap::new();
         let mut found = tree_path.is_root();
-        match self.base_entry(space, &tree_path)? {
+        let view = self.base_view(&tree_path);
+        match self.base_entry_in(space, &tree_path, view)? {
             Some(Entry::Tree(id)) => {
                 found = true;
                 for (name, entry) in space.shared_tree(id)?.iter() {
@@ -933,29 +1394,169 @@ impl Workspace {
             None => {}
         }
         let local = self.upper_path(&tree_path);
-        if fs::symlink_metadata(&local).is_ok_and(|meta| meta.is_dir()) {
+        let overlay = fs::symlink_metadata(&local).ok();
+        if overlay.as_ref().is_some_and(fs::Metadata::is_dir) {
             found = true;
             for entry in fs::read_dir(&local).map_err(|e| Error::io("listing", &local, e))? {
                 let entry = entry.map_err(|e| Error::io("listing", &local, e))?;
                 let kind = entry
                     .file_type()
                     .map_err(|e| Error::io("reading", entry.path(), e))?;
-                let kind = if kind.is_dir() {
-                    EntryKind::Directory
-                } else if kind.is_symlink() {
-                    EntryKind::Symlink
-                } else {
-                    EntryKind::File
-                };
                 if let Some(name) = entry.file_name().to_str() {
-                    entries.insert(name.to_owned(), kind);
+                    entries.insert(name.to_owned(), kind_of(kind));
                 }
+            }
+        }
+        if let Some(cached) = self.cache_local(&tree_path)
+            && is_real_dir(&cached)
+        {
+            if !found && overlay.is_none() && self.cached(space, &tree_path, view)?.is_some() {
+                found = true;
+            }
+            if found {
+                self.list_cached(space, &tree_path, &cached, &mut entries)?;
             }
         }
         if !found {
             return Err(Error::NotFound(tree_path.to_string()));
         }
         Ok(entries.into_iter().collect())
+    }
+
+    /// Adds the held version's entries in the directory `path`, kept at `cached`, that the
+    /// workspace shows and the layers above do not have.
+    fn list_cached(
+        &self,
+        space: &Space,
+        path: &TreePath,
+        cached: &Path,
+        entries: &mut BTreeMap<String, EntryKind>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(cached).map_err(|e| Error::io("listing", cached, e))? {
+            let entry = entry.map_err(|e| Error::io("listing", cached, e))?;
+            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            let Ok(child) = Name::try_from(name.as_str()).map(|name| path.join(&name)) else {
+                continue;
+            };
+            if entries.contains_key(&name) {
+                continue;
+            }
+            if self
+                .cached(space, &child, self.base_view(&child))?
+                .is_some()
+            {
+                let kind = entry
+                    .file_type()
+                    .map_err(|e| Error::io("reading", entry.path(), e))?;
+                entries.insert(name, kind_of(kind));
+            }
+        }
+        Ok(())
+    }
+
+    /// The date the workspace shows each file and link of its base, by path, with the key of
+    /// its content: what a build cache version saves as its `dates`. Paths the overlay
+    /// replaced or removed are left out.
+    pub(crate) fn base_dates(&mut self, space: &Space) -> Result<Vec<(TreePath, u64, SystemTime)>> {
+        let mut pending = vec![(TreePath::root(), self.base_tree(space)?)];
+        let mut dates = Vec::new();
+        while let Some((dir, tree)) = pending.pop() {
+            for (name, entry) in space.shared_tree(tree)?.iter() {
+                let path = dir.join(name);
+                match self.locate(space, &path)? {
+                    Some(Located::Base(Entry::Tree(id))) => pending.push((path, id)),
+                    Some(Located::Local(local)) if is_real_dir(&local) => {
+                        if let Entry::Tree(id) = entry {
+                            pending.push((path, *id));
+                        }
+                    }
+                    Some(Located::Base(entry)) => {
+                        let at = self.stamp(&path, &entry)?;
+                        dates.push((path, entry_key(&entry), at));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        dates.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(dates)
+    }
+
+    /// The held version's entries the workspace shows, each with where the version keeps
+    /// it, every directory before what it holds.
+    pub(crate) fn shown_cached(&self, space: &Space) -> Result<Vec<(TreePath, PathBuf)>> {
+        let mut shown = Vec::new();
+        let Some(root) = self.cache_local(&TreePath::root()) else {
+            return Ok(shown);
+        };
+        let mut pending = vec![(TreePath::root(), root)];
+        while let Some((dir, local)) = pending.pop() {
+            let mut children = fs::read_dir(&local)
+                .map_err(|e| Error::io("listing", &local, e))?
+                .collect::<std::io::Result<Vec<_>>>()
+                .map_err(|e| Error::io("listing", &local, e))?;
+            children.sort_by_key(fs::DirEntry::file_name);
+            for child in children {
+                let Some(name) = child
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| Name::try_from(name).ok())
+                else {
+                    continue;
+                };
+                let path = dir.join(&name);
+                let cached = child.path();
+                let descend = match self.locate(space, &path)? {
+                    Some(Located::Cached(found)) => {
+                        shown.push((path.clone(), found));
+                        is_real_dir(&cached)
+                    }
+                    Some(Located::Local(found)) => is_real_dir(&found) && is_real_dir(&cached),
+                    Some(Located::Base(Entry::Tree(_))) => is_real_dir(&cached),
+                    _ => false,
+                };
+                if descend {
+                    pending.push((path, cached));
+                }
+            }
+        }
+        shown.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(shown)
+    }
+
+    /// Moves the overlay's outermost derived paths into `files`, at the same paths: a
+    /// rename, so nothing is copied, unless `files` is on another file system. Returns
+    /// them.
+    pub(crate) fn take_derived(&mut self, space: &Space, files: &Path) -> Result<Vec<TreePath>> {
+        let mut taken = Vec::new();
+        for (path, class) in self.kept_local(space)? {
+            if class != Class::Derived {
+                continue;
+            }
+            let from = self.upper_path(&path);
+            let mut to = files.to_owned();
+            for name in path.components() {
+                to.push(name.as_str());
+            }
+            if let Some(parent) = to.parent() {
+                make_dirs(parent)?;
+            }
+            self.changed_overlay();
+            match fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+                    copy_tree(&from, &to)?;
+                    let meta =
+                        fs::symlink_metadata(&from).map_err(|e| Error::io("reading", &from, e))?;
+                    remove_local(&from, &meta)?;
+                }
+                Err(e) => return Err(Error::io("moving", &from, e)),
+            }
+            taken.push(path);
+        }
+        Ok(taken)
     }
 
     /// The uncommitted changes a commit would take: source paths added or written, then
@@ -991,12 +1592,14 @@ impl Workspace {
     }
 
     /// The classifier for this workspace's view: the space owner's rules, and the
-    /// `.gitignore` files the workspace shows.
+    /// `.gitignore` files the workspace shows in its overlay and base. One the cache layer
+    /// shows is at a derived path already, so it decides nothing.
     fn classifier<'view>(&'view self, space: &'view Space) -> Result<Classifier<'view>> {
         let owner = space.owner_rules()?;
         Ok(Classifier::new(&owner, move |dir: &TreePath| {
-            let file = Name::try_from(".gitignore").ok()?;
-            self.read(space, &dir.join(&file).to_string()).ok()
+            let file = Name::try_from(GITIGNORE).ok()?;
+            self.read_in(space, &dir.join(&file), Layers::AboveCache)
+                .ok()
         }))
     }
 
@@ -1165,11 +1768,32 @@ impl Workspace {
     }
 }
 
-fn make_dirs(dir: &Path) -> Result<()> {
+/// Reads a whiteout log: `+path` adds a whiteout, `-path` drops one, a bare path adds one.
+/// A missing log has none.
+fn read_whiteouts(path: &Path) -> Result<BTreeSet<TreePath>> {
+    let mut whiteouts = BTreeSet::new();
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            for line in text.lines() {
+                if let Some(dropped) = line.strip_prefix('-') {
+                    whiteouts.remove(&TreePath::try_from(dropped)?);
+                } else {
+                    let added = line.strip_prefix('+').unwrap_or(line);
+                    whiteouts.insert(TreePath::try_from(added)?);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::io("reading", path, e)),
+    }
+    Ok(whiteouts)
+}
+
+pub(crate) fn make_dirs(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).map_err(|e| Error::io("creating", dir, e))
 }
 
-fn remove_local(path: &Path, meta: &fs::Metadata) -> Result<()> {
+pub(crate) fn remove_local(path: &Path, meta: &fs::Metadata) -> Result<()> {
     let removed = if meta.is_dir() {
         fs::remove_dir_all(path)
     } else {
@@ -1178,7 +1802,7 @@ fn remove_local(path: &Path, meta: &fs::Metadata) -> Result<()> {
     removed.map_err(|e| Error::io("removing", path, e))
 }
 
-fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_synced(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     let temporary = dir.join(format!(".{name}.new"));
     let mut file = File::create(&temporary).map_err(|e| Error::io("creating", &temporary, e))?;
     file.write_all(bytes)

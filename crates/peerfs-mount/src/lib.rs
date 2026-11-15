@@ -17,7 +17,12 @@
 //! - A base file's modification time is the workspace's stamp for its content at that
 //!   path: the overlay file's mtime when a commit took it, or when the workspace first saw
 //!   that content. Stamps persist, so neither a commit nor a new mount makes unchanged
-//!   files look modified.
+//!   files look modified. With a build cache, an unchanged source file is dated as the
+//!   cache version's build saw it.
+//! - A build cache version the workspace holds shows under its derived paths, read from the
+//!   version's real files with their own modes and dates. It is never written: the first
+//!   write, truncation, `chmod` or `touch` copies a file up, as for a base file, and
+//!   removing or renaming one records a whiteout.
 //! - The mount keeps one view of the workspace and reloads it only when the local API
 //!   has changed its state or removals. It keeps recently used overlay files open, and
 //!   closes them all when the local API changes the overlay's files.
@@ -348,6 +353,7 @@ impl WorkspaceFs {
                 state
                     .inodes
                     .split_links(|path| match workspace.locate(&space, path) {
+                        // A cached file is no overlay file, so it shares no link.
                         Ok(Some(Located::Local(local))) => fs::symlink_metadata(local)
                             .ok()
                             .map(|meta| (meta.dev(), meta.ino())),
@@ -383,7 +389,7 @@ impl WorkspaceFs {
         st.st_gid = self.gid;
         st.st_blksize = 4096;
         match located {
-            Located::Local(local) => {
+            Located::Local(local) | Located::Cached(local) => {
                 let meta = fs::symlink_metadata(&local)?;
                 st.st_mode = meta.mode();
                 st.st_nlink = meta.nlink();
@@ -463,7 +469,7 @@ impl WorkspaceFs {
                 return read_at(file, size, offset);
             }
             match workspace.locate(space, &path).map_err(to_errno)? {
-                Some(Located::Local(local)) => {
+                Some(Located::Local(local) | Located::Cached(local)) => {
                     state.files.open(&path, &local, Access::Read)?;
                     let file = state
                         .files
@@ -488,7 +494,12 @@ impl WorkspaceFs {
     fn write_bytes(&self, inode: u64, at: WriteAt, data: &[u8]) -> io::Result<usize> {
         self.with(|space, workspace, state| {
             let path = state.inodes.path(inode)?;
+            if is_gitignore(&path) {
+                workspace.forget_classes();
+            }
             let WriteAt::Offset(offset) = at else {
+                // A file held open for reading may be the cached one this copies up.
+                state.files.forget(&path);
                 let local = workspace.copy_up(space, &path).map_err(to_errno)?;
                 FsOpenOptions::new()
                     .append(true)
@@ -616,6 +627,11 @@ impl FileSystem for WorkspaceFs {
                 | SetattrValid::ATIME_NOW
                 | SetattrValid::MTIME_NOW;
             if valid.intersects(changes) {
+                if is_gitignore(&path) {
+                    workspace.forget_classes();
+                }
+                // A file held open for reading may be the cached one this copies up.
+                state.files.forget(&path);
                 let local = workspace.copy_up(space, &path).map_err(to_errno)?;
                 if valid.contains(SetattrValid::SIZE) {
                     let file = FsOpenOptions::new().write(true).open(&local)?;
@@ -637,7 +653,7 @@ impl FileSystem for WorkspaceFs {
         self.with(|space, workspace, state| {
             let path = state.inodes.path(inode)?;
             match workspace.locate(space, &path).map_err(to_errno)? {
-                Some(Located::Local(local)) => {
+                Some(Located::Local(local) | Located::Cached(local)) => {
                     Ok(fs::read_link(local)?.into_os_string().into_encoded_bytes())
                 }
                 Some(Located::Base(Entry::Symlink(target))) => Ok(target.into_bytes()),
@@ -751,6 +767,8 @@ impl FileSystem for WorkspaceFs {
         self.with(|space, workspace, state| {
             let from = state.inodes.path(inode)?;
             let to = child(&state.inodes.path(newparent)?, newname)?;
+            // Linking copies `from` up, if it is only in the base or the cache.
+            state.files.forget(&from);
             state.files.forget(&to);
             workspace
                 .link(space, &from, &to)
@@ -1057,6 +1075,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Whether `path` names a `.gitignore`, whose changes can change which paths are derived.
+fn is_gitignore(path: &TreePath) -> bool {
+    path.split_last()
+        .is_some_and(|(_, name)| name.as_str() == ".gitignore")
+}
+
 fn child(parent: &TreePath, name: &CStr) -> io::Result<TreePath> {
     child_named(parent, name.to_str().map_err(|_| errno(libc::EINVAL))?)
 }
@@ -1068,7 +1092,9 @@ fn child_named(parent: &TreePath, name: &str) -> io::Result<TreePath> {
 
 fn is_dir(located: Option<&Located>) -> bool {
     match located {
-        Some(Located::Local(local)) => fs::symlink_metadata(local).is_ok_and(|meta| meta.is_dir()),
+        Some(Located::Local(local) | Located::Cached(local)) => {
+            fs::symlink_metadata(local).is_ok_and(|meta| meta.is_dir())
+        }
         Some(Located::Base(entry)) => matches!(entry, Entry::Tree(_)),
         None => false,
     }
