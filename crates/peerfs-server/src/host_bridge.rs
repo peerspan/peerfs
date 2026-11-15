@@ -481,14 +481,35 @@ mod tests {
             let mut requests = Vec::new();
             for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut buf = vec![0u8; 8192];
-                let n = stream.read(&mut buf).unwrap();
-                requests.push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                requests.push(read_request(&mut stream));
                 stream.write_all(response.as_bytes()).unwrap();
             }
             requests
         });
         (path, handle)
+    }
+
+    /// Reads one whole request, its head and its body. The client may send them in
+    /// separate writes, and answering before the body has arrived fails the client's write.
+    fn read_request(stream: &mut std::os::unix::net::UnixStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            assert!(n > 0, "the client closed before sending a whole request");
+            request.extend_from_slice(&buf[..n]);
+            let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map_or(0, |value| value.trim().parse().unwrap());
+            if request.len() >= end + 4 + length {
+                return String::from_utf8_lossy(&request).into_owned();
+            }
+        }
     }
 
     fn ok(body: &str) -> String {
