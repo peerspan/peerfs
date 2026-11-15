@@ -154,6 +154,50 @@ pub struct WorkspaceInfo {
     /// The latest snapshot of its current change, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    /// The build cache version it holds, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<WorkspaceCache>,
+}
+
+/// The build cache version a workspace holds and shows, read-only, under its derived paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCache {
+    /// The cache.
+    pub name: String,
+    /// The version, which never changes.
+    pub version: String,
+    /// The commit whose tree the version's files were built from.
+    pub commit: String,
+}
+
+/// An entry of `GET /v1/caches`, and the answer to `POST /v1/caches/{name}`: a build cache,
+/// as its current version describes it. Caches stay on this host; only the space's owner
+/// reaches them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheInfo {
+    /// The cache: 1 to 128 lowercase ASCII letters, digits, `.`, `_` and `-`, starting with
+    /// a letter or digit.
+    pub name: String,
+    /// The commit whose tree the current version was built from.
+    pub commit: String,
+    /// When the current version was saved, in RFC 3339 UTC to the second.
+    pub saved_at: String,
+    /// The bytes of the current version's files.
+    pub bytes: u64,
+    /// The versions held: the current one, and earlier ones workspaces still hold.
+    pub versions: u64,
+}
+
+/// `POST /v1/caches/{name}`: save the derived files a workspace shows as the cache's new
+/// current version, then discard the workspace. `conflict` when the workspace has
+/// uncommitted source changes, is lent, or is mounted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveCacheRequest {
+    /// The workspace.
+    pub workspace: String,
 }
 
 /// `POST /v1/workspaces/{name}/mount`: mount the workspace at a directory, and an entry
@@ -202,6 +246,10 @@ pub struct CreateWorkspaceRequest {
     pub name: String,
     /// The branch it follows.
     pub branch: String,
+    /// A build cache whose current version the workspace holds. One that does not exist is
+    /// no error: the workspace holds none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<String>,
 }
 
 /// What kind of entry a directory listing names.
@@ -322,6 +370,18 @@ pub struct GcResponse {
     pub snapshots_kept: usize,
     /// Snapshots dropped, or that would be.
     pub snapshots_dropped: usize,
+    /// Build cache versions dropped, or that would be: those no cache names as current and
+    /// no workspace holds.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_versions_dropped: usize,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes a reference"
+)]
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 /// `POST /v1/workspaces/{name}/restore`: restore the workspace's source paths to one of

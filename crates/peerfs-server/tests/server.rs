@@ -721,3 +721,126 @@ async fn a_lent_workspace_is_left_alone_until_it_is_given_back() {
         Some("not_found")
     );
 }
+
+/// The error code of a failed request.
+fn code<T>(result: Result<T, peerfs_api::ClientError>) -> Option<String> {
+    result.err().and_then(|e| e.code().map(str::to_owned))
+}
+
+#[tokio::test]
+async fn saving_a_cache_is_refused_for_a_changed_or_lent_workspace() {
+    let running = start(None).await;
+    let client = &running.client;
+    commit_files(client, "setup", &[("src/lib.rs", "pub fn one() {}\n")]).await;
+    client.create_workspace("dirty", "main").await.unwrap();
+    client.write("dirty", "target/a", "output").await.unwrap();
+    client
+        .write("dirty", "src/lib.rs", "changed\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        code(client.save_cache("bc", "dirty").await).as_deref(),
+        Some("conflict"),
+        "uncommitted source changes"
+    );
+    client.create_workspace("lent", "main").await.unwrap();
+    let lease = client.lend("lent").await.unwrap();
+    assert_eq!(
+        code(client.save_cache("bc", "lent").await).as_deref(),
+        Some("conflict"),
+        "lent"
+    );
+    tokio::task::spawn_blocking(move || lease.give_back())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        code(client.save_cache("Bad", "lent").await).as_deref(),
+        Some("invalid")
+    );
+    assert_eq!(
+        code(client.save_cache("bc", "missing").await).as_deref(),
+        Some("not_found")
+    );
+    assert_eq!(
+        code(client.remove_cache("nothing").await).as_deref(),
+        Some("not_found")
+    );
+    // Nothing was saved, and the refused workspaces are as they were.
+    assert_eq!(client.caches().await.unwrap(), Vec::new());
+    assert_eq!(client.changes("dirty").await.unwrap().len(), 2);
+    client.save_cache("bc", "lent").await.unwrap();
+}
+
+#[tokio::test]
+async fn caches_are_saved_held_listed_and_removed_over_the_socket() {
+    let running = start(None).await;
+    let client = &running.client;
+    // Its presence is how a client tells that this server keeps caches.
+    assert!(client.has_caches().await.unwrap());
+    assert_eq!(client.caches().await.unwrap(), Vec::new());
+    commit_files(client, "setup", &[("src/lib.rs", "pub fn one() {}\n")]).await;
+    let head = client.branches().await.unwrap()[0].head.clone();
+
+    // A missing cache is no error: the workspace holds none.
+    let plain = client
+        .create_workspace_with_cache("build", "main", Some("bc"))
+        .await
+        .unwrap();
+    assert_eq!(plain.cache, None);
+    client
+        .write("build", "target/debug/a", "output")
+        .await
+        .unwrap();
+    let saved = client.save_cache("bc", "build").await.unwrap();
+    assert_eq!(
+        (
+            saved.name.as_str(),
+            saved.commit.as_str(),
+            saved.bytes,
+            saved.versions
+        ),
+        ("bc", head.as_str(), 6, 1)
+    );
+    assert!(
+        saved.saved_at.ends_with('Z') && saved.saved_at.len() == 20,
+        "{saved:?}"
+    );
+    assert_eq!(client.caches().await.unwrap(), vec![saved.clone()]);
+    assert_eq!(
+        code(client.workspace("build").await).as_deref(),
+        Some("not_found")
+    );
+
+    let holding = client
+        .create_workspace_with_cache("task", "main", Some("bc"))
+        .await
+        .unwrap()
+        .cache
+        .expect("holds the current version");
+    assert_eq!(
+        (holding.name.as_str(), holding.commit.as_str()),
+        ("bc", head.as_str())
+    );
+    assert_eq!(client.workspace("task").await.unwrap().cache, Some(holding));
+    assert_eq!(
+        &client.read("task", "target/debug/a").await.unwrap()[..],
+        b"output"
+    );
+    let raw = client
+        .send(Method::GET, "/v1/workspaces/task", None, "".into())
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&raw.body).contains(r#""cache":{"name":"bc""#));
+
+    client.remove_cache("bc").await.unwrap();
+    assert_eq!(client.caches().await.unwrap(), Vec::new());
+    // The version a workspace holds stays until it ends.
+    assert_eq!(
+        &client.read("task", "target/debug/a").await.unwrap()[..],
+        b"output"
+    );
+    client.discard("task").await.unwrap();
+    let report = client.gc(&GcRequest { dry_run: false }).await.unwrap();
+    assert_eq!(report.cache_versions_dropped, 1);
+}

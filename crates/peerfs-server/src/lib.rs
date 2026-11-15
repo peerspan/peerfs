@@ -3,6 +3,10 @@
 //! Requests run one at a time against the space, so agents working concurrently serialize
 //! here instead of contending for the space's lock. The routes and bodies are those of
 //! [`peerfs_api`].
+//!
+//! Build caches are reached only here, on the space's owner-only socket: `GET /v1/caches`,
+//! whose presence tells a client this server keeps them, and `POST, DELETE
+//! /v1/caches/{name}`. The host bridge carries none of it.
 
 pub mod host_bridge;
 
@@ -12,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
@@ -23,16 +27,17 @@ use axum::http::StatusCode;
 use axum::http::header::{CONNECTION, UPGRADE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use hyper_util::rt::TokioIo;
 use peerfs_api::{
-    AdvanceRequest, BranchInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitRequest,
-    CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind, ErrorBody,
-    ExportRequest, FetchRequest, ForkRequest, Frontend, GcRequest, GcResponse, HaveRequest,
-    HaveResponse, HostKey, ImportRequest, LEASE_PROTOCOL, LEASE_RETURN, LEASE_RETURNED,
-    MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest, PushResponse,
-    ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SOCKET_NAME, SnapshotRequest,
-    SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceInfo,
+    AdvanceRequest, BranchInfo, CacheInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo,
+    CommitRequest, CommitResponse, ConflictInfo, CreateWorkspaceRequest, DirEntry, EntryKind,
+    ErrorBody, ExportRequest, FetchRequest, ForkRequest, Frontend, GcRequest, GcResponse,
+    HaveRequest, HaveResponse, HostKey, ImportRequest, LEASE_PROTOCOL, LEASE_RETURN,
+    LEASE_RETURNED, MergeRequest, MergeResponse, MountInfo, PullRequest, PullResponse, PushRequest,
+    PushResponse, ReceiveResponse, RestoreRequest, RestoreResponse, Revision, SOCKET_NAME,
+    SaveCacheRequest, SnapshotRequest, SnapshotResponse, SpaceInfo, TrackingInfo, WorkspaceCache,
+    WorkspaceInfo,
 };
 use peerfs_core::{
     Author, Change, Commit, CommitOutcome, Conflict, ConflictKind, Error, FETCH_BATCH, GcOptions,
@@ -170,6 +175,11 @@ fn router_with(state: AppState) -> Router {
         )
         .route("/v1/mounts", get(mounts))
         .route("/v1/gc", post(gc))
+        .route("/v1/caches", get(caches))
+        .route(
+            "/v1/caches/{name}",
+            post(save_cache).merge(delete(remove_cache)),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             refuse_lent,
@@ -354,7 +364,8 @@ impl From<Error> for ApiError {
             | Error::NoSuchBranch(_)
             | Error::NoSuchWorkspace(_)
             | Error::MissingObject { .. }
-            | Error::NoSuchSnapshot { .. } => (StatusCode::NOT_FOUND, "not_found"),
+            | Error::NoSuchSnapshot { .. }
+            | Error::NoSuchCache(_) => (StatusCode::NOT_FOUND, "not_found"),
             Error::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => {
                 (StatusCode::NOT_FOUND, "not_found")
             }
@@ -371,6 +382,7 @@ impl From<Error> for ApiError {
             | Error::WrongEntry { .. }
             | Error::Unsupported { .. }
             | Error::InvalidHost(_)
+            | Error::InvalidCacheName(_)
             | Error::AmbiguousSnapshot(_) => (StatusCode::BAD_REQUEST, "invalid"),
             Error::UnknownHostKey { .. } => (StatusCode::FORBIDDEN, "forbidden"),
             Error::Remote(_) | Error::RemoteObject { .. } => (StatusCode::BAD_GATEWAY, "remote"),
@@ -450,7 +462,51 @@ fn workspace_info(workspace: &Workspace) -> WorkspaceInfo {
         branch: workspace.branch().to_owned(),
         base: workspace.base().to_string(),
         snapshot: workspace.snapshot().map(|snapshot| snapshot.to_string()),
+        cache: workspace.cache().map(|held| WorkspaceCache {
+            name: held.name.clone(),
+            version: held.version.clone(),
+            commit: held.commit.to_string(),
+        }),
     }
+}
+
+fn cache_info(cache: peerfs_core::CacheInfo) -> CacheInfo {
+    CacheInfo {
+        commit: cache.commit.to_string(),
+        saved_at: rfc3339(cache.saved_at),
+        bytes: cache.bytes,
+        versions: u64::try_from(cache.versions).unwrap_or(u64::MAX),
+        name: cache.name,
+    }
+}
+
+/// A time in RFC 3339 UTC, to the second: `1970-01-01T00:00:00Z`.
+fn rfc3339(at: SystemTime) -> String {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // Days since 1970-01-01 to a civil date, after Howard Hinnant's `civil_from_days`.
+    let shifted = days + 719_468;
+    let era = shifted / 146_097;
+    let day_of_era = shifted % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
 fn commit_info(id: ObjectId, commit: Commit) -> CommitInfo {
@@ -637,8 +693,57 @@ async fn create_workspace(
 ) -> ApiResult<(StatusCode, Json<WorkspaceInfo>)> {
     let Json(request) = body?;
     with_space(&state, move |space, _| {
-        let workspace = space.create_workspace(&request.name, &request.branch)?;
+        let workspace = space.create_workspace_with_cache(
+            &request.name,
+            &request.branch,
+            request.cache.as_deref(),
+        )?;
         Ok((StatusCode::CREATED, Json(workspace_info(&workspace))))
+    })
+    .await
+}
+
+async fn caches(State(state): State<AppState>) -> ApiResult<Json<Vec<CacheInfo>>> {
+    with_space(&state, |space, _| {
+        Ok(Json(space.caches()?.into_iter().map(cache_info).collect()))
+    })
+    .await
+}
+
+async fn save_cache(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+    body: Result<Json<SaveCacheRequest>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<CacheInfo>)> {
+    let Json(request) = body?;
+    let workspace = request.workspace;
+    // Checked outside the space's lock, as for discarding: a mount's requests take it.
+    if lock_mounts(&state).contains_key(&workspace) {
+        return Err(ApiError::conflict(format!(
+            "workspace {workspace} is mounted; unmount it first"
+        )));
+    }
+    let shared = Arc::clone(&state);
+    with_space(&state, move |space, _| {
+        // Under the space's lock, which a lease is granted under too.
+        if lock_lent(&shared).contains(&workspace) {
+            return Err(ApiError::conflict(format!(
+                "workspace {workspace} is lent to another process"
+            )));
+        }
+        let saved = space.save_cache(&name, &workspace)?;
+        Ok((StatusCode::CREATED, Json(cache_info(saved))))
+    })
+    .await
+}
+
+async fn remove_cache(
+    State(state): State<AppState>,
+    UrlPath(name): UrlPath<String>,
+) -> ApiResult<StatusCode> {
+    with_space(&state, move |space, _| {
+        space.remove_cache(&name)?;
+        Ok(StatusCode::NO_CONTENT)
     })
     .await
 }
@@ -883,6 +988,7 @@ async fn gc(
             packs_rewritten: report.packs_rewritten,
             snapshots_kept: report.snapshots_kept,
             snapshots_dropped: report.snapshots_dropped,
+            cache_versions_dropped: report.cache_versions_dropped,
         }))
     })
     .await
@@ -1479,4 +1585,18 @@ async fn merge(
         Ok(Json(response))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times_are_written_in_rfc_3339() {
+        assert_eq!(rfc3339(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        let at = |seconds| UNIX_EPOCH + Duration::from_secs(seconds);
+        assert_eq!(rfc3339(at(1_700_000_000)), "2023-11-14T22:13:20Z");
+        assert_eq!(rfc3339(at(951_782_400)), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339(at(1_794_787_199)), "2026-11-15T23:59:59Z");
+    }
 }
