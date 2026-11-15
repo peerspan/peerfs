@@ -661,6 +661,7 @@ impl Workspace {
 
     pub(crate) fn set_merging(&mut self, merging: Option<ObjectId>) -> Result<()> {
         self.merging = merging;
+        self.forget_classes();
         self.save()
     }
 
@@ -1707,6 +1708,8 @@ impl Workspace {
         self.base_tree.set(None);
         self.merging = None;
         self.base = commit;
+        // The new base may hold other `.gitignore`s.
+        self.forget_classes();
         self.save()
     }
 
@@ -1725,6 +1728,7 @@ impl Workspace {
             Some(&Entry::Tree(head_tree)),
             Some(&Entry::Tree(target)),
         )?;
+        self.forget_classes();
         self.save()?;
         self.save_whiteouts()
     }

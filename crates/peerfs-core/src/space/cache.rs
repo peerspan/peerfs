@@ -472,9 +472,9 @@ fn copy_file(from: &Path, to: &Path, meta: &fs::Metadata) -> Result<()> {
     if let Ok(accessed) = meta.accessed() {
         times = times.set_accessed(accessed);
     }
-    File::options()
-        .write(true)
-        .open(to)
+    // Opened only for reading: `fs::copy` gave it the source's mode, which may not let the
+    // owner write it, and setting dates needs no write access.
+    File::open(to)
         .and_then(|file| file.set_times(times))
         .map_err(|e| Error::io("copying", to, e))
 }
