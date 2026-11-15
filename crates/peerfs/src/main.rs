@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use peerfs_api::{
-    Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitResponse, EntryKind, Frontend,
-    GcRequest, GcResponse, MergeResponse, Revision, SnapshotResponse,
+    CacheInfo, Caller, ChangeInfo, Client, ClientError, CommitInfo, CommitResponse, EntryKind,
+    Frontend, GcRequest, GcResponse, MergeResponse, Revision, SnapshotResponse,
 };
 use peerfs_core::{Author, HostBinding, Space};
 use peerfs_server::host_bridge::{HostClient, HostKeyCheck, HostSigner};
@@ -156,6 +156,10 @@ enum Command {
     /// Work in a workspace.
     #[command(subcommand, name = "ws")]
     Workspace(WorkspaceCommand),
+    /// Keep build caches: the derived files of a build, kept on this host and shown
+    /// read-only under the derived paths of workspaces created with one.
+    #[command(subcommand)]
+    Cache(CacheCommand),
     /// Run as an agent's hook.
     #[command(subcommand)]
     Hook(HookCommand),
@@ -179,12 +183,39 @@ enum HostsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Save the derived files a workspace shows as the cache's new current version, then
+    /// discard the workspace. Refused while it has uncommitted source changes, is mounted,
+    /// or is lent.
+    Save {
+        /// The cache: 1 to 128 lowercase letters, digits, `.`, `_` and `-`.
+        name: String,
+        /// The workspace whose derived files to save.
+        #[arg(long = "from")]
+        workspace: String,
+    },
+    /// List the caches, with their current version's commit, when it was saved, its size,
+    /// and how many versions are held.
+    Ls {
+        /// Print JSON, as `GET /v1/caches` answers.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a cache. Versions workspaces hold stay until those workspaces end.
+    Rm { name: String },
+}
+
+#[derive(Debug, Subcommand)]
 enum WorkspaceCommand {
     /// Create a workspace following a branch.
     Create {
         name: String,
-        #[arg(long, default_value = "main")]
+        #[arg(long, visible_alias = "from", default_value = "main")]
         branch: String,
+        /// Hold this build cache's current version, shown read-only under the derived
+        /// paths. A cache that does not exist is no error: the workspace has none.
+        #[arg(long)]
+        cache: Option<String>,
     },
     /// List workspaces.
     List,
@@ -657,8 +688,43 @@ async fn client_command(
             }
         }
         Command::Workspace(command) => return workspace(client, command, caller, out).await,
+        Command::Cache(command) => cache(client, command, out).await?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `cache`: save, list and remove build caches.
+async fn cache(client: &Client, command: CacheCommand, out: &mut impl Write) -> Result<()> {
+    match command {
+        CacheCommand::Save { name, workspace } => {
+            let saved = client.save_cache(&name, &workspace).await?;
+            writeln!(out, "{}", cache_line(&saved))?;
+        }
+        CacheCommand::Ls { json: true } => {
+            serde_json::to_writer_pretty(&mut *out, &client.caches().await?)?;
+            writeln!(out)?;
+        }
+        CacheCommand::Ls { json: false } => {
+            for cache in client.caches().await? {
+                writeln!(out, "{}", cache_line(&cache))?;
+            }
+        }
+        CacheCommand::Rm { name } => client.remove_cache(&name).await?,
+    }
+    Ok(())
+}
+
+/// A cache as `cache ls` prints it.
+fn cache_line(cache: &CacheInfo) -> String {
+    let versions = if cache.versions == 1 {
+        "1 version".to_owned()
+    } else {
+        format!("{} versions", cache.versions)
+    };
+    format!(
+        "{} {} saved {}, {} bytes, {versions}",
+        cache.name, cache.commit, cache.saved_at, cache.bytes
+    )
 }
 
 const MIB: u64 = 1024 * 1024;
@@ -684,6 +750,13 @@ fn print_gc(report: &GcResponse, out: &mut impl Write) -> Result<()> {
         "kept {} snapshots and {} objects",
         report.snapshots_kept, report.objects_kept
     )?;
+    if report.cache_versions_dropped > 0 {
+        writeln!(
+            out,
+            "{verb} {} build cache versions no cache or workspace holds",
+            report.cache_versions_dropped
+        )?;
+    }
     if report.objects_waiting > 0 {
         writeln!(
             out,
@@ -790,6 +863,53 @@ async fn commit(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `ws create`: says which cache version the workspace holds, if one was asked for.
+async fn create(
+    client: &Client,
+    name: &str,
+    branch: &str,
+    cache: Option<&str>,
+    out: &mut impl Write,
+) -> Result<()> {
+    let workspace = client
+        .create_workspace_with_cache(name, branch, cache)
+        .await?;
+    let held = match (&workspace.cache, cache) {
+        (Some(held), _) => format!(", with cache {} from {}", held.name, held.commit),
+        (None, Some(cache)) => format!(", with no cache: {cache} does not exist"),
+        (None, None) => String::new(),
+    };
+    writeln!(
+        out,
+        "{} follows {} at {}{held}",
+        workspace.name, workspace.branch, workspace.base
+    )?;
+    Ok(())
+}
+
+/// `ws status`: the uncommitted changes, the paths kept local, and the cache version held.
+async fn status(client: &Client, name: &str, out: &mut impl Write) -> Result<()> {
+    for change in client.changes(name).await? {
+        match change {
+            ChangeInfo::Added { path } => writeln!(out, "A {path}")?,
+            ChangeInfo::Written { path } => writeln!(out, "M {path}")?,
+            ChangeInfo::Removed { path } => writeln!(out, "D {path}")?,
+            ChangeInfo::Kept { path, class } => {
+                writeln!(out, "  {path} (kept local: {class})")?;
+            }
+        }
+    }
+    match client.workspace(name).await?.cache {
+        Some(held) => writeln!(
+            out,
+            "cache {} version {}, built from {}",
+            held.name, held.version, held.commit
+        )?,
+        None => writeln!(out, "no cache")?,
+    }
+    Ok(())
+}
+
 async fn workspace(
     client: &Client,
     command: WorkspaceCommand,
@@ -797,14 +917,11 @@ async fn workspace(
     out: &mut impl Write,
 ) -> Result<ExitCode> {
     match command {
-        WorkspaceCommand::Create { name, branch } => {
-            let workspace = client.create_workspace(&name, &branch).await?;
-            writeln!(
-                out,
-                "{} follows {} at {}",
-                workspace.name, workspace.branch, workspace.base
-            )?;
-        }
+        WorkspaceCommand::Create {
+            name,
+            branch,
+            cache,
+        } => create(client, &name, &branch, cache.as_deref(), out).await?,
         WorkspaceCommand::List => {
             for workspace in client.workspaces().await? {
                 writeln!(
@@ -838,18 +955,7 @@ async fn workspace(
                 writeln!(out, "{}{suffix}", entry.name)?;
             }
         }
-        WorkspaceCommand::Status { name } => {
-            for change in client.changes(&name).await? {
-                match change {
-                    ChangeInfo::Added { path } => writeln!(out, "A {path}")?,
-                    ChangeInfo::Written { path } => writeln!(out, "M {path}")?,
-                    ChangeInfo::Removed { path } => writeln!(out, "D {path}")?,
-                    ChangeInfo::Kept { path, class } => {
-                        writeln!(out, "  {path} (kept local: {class})")?;
-                    }
-                }
-            }
-        }
+        WorkspaceCommand::Status { name } => status(client, &name, out).await?,
         WorkspaceCommand::Mount(args) => mount(client, &args, out).await?,
         WorkspaceCommand::VhostUser(_) => unreachable!("handled before connecting"),
         WorkspaceCommand::Unmount { name } => client.unmount(&name).await?,
