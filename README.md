@@ -92,6 +92,32 @@ the request names.
 | `POST /v1/push` | Send a local revision to another server (`{to, branch, from}`) and advance its branch; `conflict` if it moved |
 | `POST /v1/workspaces/{name}/merge` | Merge a revision (`{from, caller}`); the outcome is `up_to_date`, `fast_forward`, `merged` or `conflicted` |
 
+### Object batches
+
+`POST /v1/objects/fetch` answers, and `POST /v1/objects/receive` takes, a batch of objects as
+`application/octet-stream`:
+
+```text
+batch  = count object*count
+object = id kind length bytes
+id     = 0x01 digest          ; 33 bytes: the algorithm (1, BLAKE3-256) and its 32-byte digest
+kind   = 0x01 blob | 0x02 file | 0x03 tree | 0x04 commit
+count, length                 ; unsigned LEB128, minimal (no trailing 0x00 continuation byte)
+```
+
+`bytes` is the object's canonical encoding, the bytes its identity is computed from: BLAKE3 in
+key-derivation mode with the context `peerfs 2026-10-27 KIND` (for example
+`peerfs 2026-10-27 blob`). An id's text form, as in `{ids}`, is the 33 bytes in lowercase
+hexadecimal. A batch is read strictly: a truncated value, a non-minimal or overflowing integer,
+an unknown algorithm or kind, or bytes left after the last object make it malformed.
+
+A fetch answers the objects held, in the order asked, leaving out those not held. A pull asks for
+at most 256 objects at a time and needs every one in that one answer: an object missing from it,
+of the wrong kind, not matching its id, or (a commit) not signed by a key of its author's host
+fails the pull. Objects it did not ask for are ignored. `receive` stores the objects in order,
+each checked against its id, and refuses one that references an object neither held nor earlier
+in the batch; those before a refused object are kept.
+
 ## Try it
 
 ```sh
